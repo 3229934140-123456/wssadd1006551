@@ -245,6 +245,7 @@ model RuleRerunBatch {
   triggerType     String   @default("MANUAL")   // MANUAL | SCHEDULED | POST_CONFIG_CHANGE
   ruleSnapshot    String?                      // 运行时的规则配置 JSON
   reportIds       String?                      // 影响的报告 ID 列表 JSON
+  details         String?                      // 每份报告的差异明细 JSON [{reportId, reportNo, newIssues, removedIssues, oldStatus, newStatus}]
   affectedCount   Int      @default(0)         // 实际影响报告数
   newIssueCount   Int      @default(0)         // 新增问题数（相比上次检查）
   removedCount    Int      @default(0)         // 消失问题数

@@ -384,7 +384,9 @@ router.post('/feedbacks/:feedbackId/verify', requireRole(UserRole.ADMIN, UserRol
           data: {
             isResolved: false,
             resolvedBy: null,
-            resolvedAction: null,
+            // v4.1 修复1：保留 resolvedAction='REJECTED' 标记，工作台"已退回"队列据此筛选
+            // 医生 revise 时会把 REJECTED 标记清掉
+            resolvedAction: 'REJECTED',
             resolvedAt: null,
             oldValue: fb.newValue, // 之前修改后的值作为新的 oldValue，医生继续在这个基础上改
             newValue: null,

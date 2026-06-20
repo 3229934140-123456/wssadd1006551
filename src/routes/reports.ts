@@ -30,7 +30,7 @@ router.get('/workbench', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER, UserRo
     if (submitterId) baseWhere.submitterId = submitterId as string
     if (reportType) baseWhere.type = reportType as string
 
-    // 基于 status 过滤 —— REJECTED 作为稳定入口：NEEDS_REVISION 且有被退回过的反馈
+    // 基于 status 过滤 —— REJECTED 稳定入口：状态=NEEDS_REVISION + 存在 resolvedAction=REJECTED 且未清除的反馈
     const STATUS_REJECTED = 'REJECTED'
     const STATUS_ALL_ACTIVE = 'ALL_ACTIVE'
     const activeStatuses = [
@@ -44,7 +44,8 @@ router.get('/workbench', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER, UserRo
     if (status === STATUS_ALL_ACTIVE) {
       baseWhere.status = { in: activeStatuses }
     } else if (status === STATUS_REJECTED) {
-      // 稳定入口：状态=NEEDS_REVISION + 曾有过 REJECTED 反馈，且医生还没提交新一轮整改
+      // v4.1 修复1：严格定义"已退回" = NEEDS_REVISION + 有 resolvedAction=REJECTED 反馈
+      // （医生 revise 后会清除这些 REJECTED 标记，所以会自动退出已退回队列）
       baseWhere.status = ReportStatus.NEEDS_REVISION
       baseWhere.auditFeedbacks = {
         some: { resolvedAction: 'REJECTED' },
@@ -55,7 +56,6 @@ router.get('/workbench', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER, UserRo
 
     // issueCategory 直接放到子查询（DB 级筛选），保证总数与列表一致
     if (issueCategory) {
-      // 不破坏已有的 auditFeedbacks.some，另起一个 AND 子句
       if (baseWhere.AND && Array.isArray(baseWhere.AND)) {
         baseWhere.AND.push({ auditFeedbacks: { some: { issueCategory: issueCategory as string } } })
       } else {
@@ -67,36 +67,38 @@ router.get('/workbench', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER, UserRo
     const size = Math.min(100, Math.max(1, parseInt(pageSize as string)))
     const skip = (pageNum - 1) * size
 
-    // --- Step 2: 并行查总数 + 列表（WHERE 完全相同，保证分页一致）---
-    const [total, reports] = await Promise.all([
-      prisma.report.count({ where: baseWhere }),
-      prisma.report.findMany({
-        where: baseWhere,
-        skip,
-        take: size,
-        include: {
-          clinic: { select: { id: true, name: true, code: true } },
-          submitter: { select: { id: true, name: true, phone: true } },
-          auditTasks: {
-            where: { status: { not: 'COMPLETED' } },
-            orderBy: { createdAt: 'desc' },
-            take: 1,
-            include: { assignedTo: { select: { id: true, name: true } } },
-          },
-          auditFeedbacks: {
-            orderBy: { createdAt: 'desc' },
-          },
-          ruleChecks: {
-            where: { severity: RuleSeverity.ERROR, passed: false },
-            take: 3,
-          },
-        },
-      }),
-    ])
+    // --- Step 2: 先查总数（WHERE=baseWhere，与列表严格一致）---
+    const total = await prisma.report.count({ where: baseWhere })
 
-    // --- Step 3: 先算每条记录的 nextHandler / lastRevisedAt / overdueDays / assignedTo（用于排序）---
+    // --- Step 3: 先查出所有匹配报告的 ID + 最小排序所需字段（用于全结果集排序）---
+    // 因为排序字段含计算值（overdueDays / nextHandler / assignedToName），无法完全在 DB 层排序
+    // 策略：分页场景下最多取 1000 条做 enriched + 排序；若 total 超过 1000 则限制 + 警告
+    const MAX_ENRICH = 1000
+    const allReports = await prisma.report.findMany({
+      where: baseWhere,
+      take: Math.min(MAX_ENRICH, total),
+      include: {
+        clinic: { select: { id: true, name: true, code: true } },
+        submitter: { select: { id: true, name: true, phone: true } },
+        auditTasks: {
+          where: { status: { not: 'COMPLETED' } },
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          include: { assignedTo: { select: { id: true, name: true } } },
+        },
+        auditFeedbacks: {
+          orderBy: { createdAt: 'desc' },
+        },
+        ruleChecks: {
+          where: { severity: RuleSeverity.ERROR, passed: false },
+          take: 3,
+        },
+      },
+    })
+
+    // --- Step 4: 对全量匹配结果做 enriched 计算 ---
     const now = dayjs()
-    type EnrichedReport = typeof reports[number] & {
+    type EnrichedReport = typeof allReports[number] & {
       _nextHandler: { type: string; role: string; userId?: string; userName?: string }
       _lastRevisedAt: Date
       _overdueDays: number
@@ -105,12 +107,13 @@ router.get('/workbench', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER, UserRo
       _pendingVerification: number
     }
 
-    const enriched = reports.map((r: any): EnrichedReport => {
+    const enriched = allReports.map((r: any): EnrichedReport => {
       const fieldFeedbacks = r.auditFeedbacks.filter((fb: any) => fb.fieldName != null)
       const totalField = fieldFeedbacks.length
       const pendingCount = fieldFeedbacks.filter((fb: any) =>
         !fb.isResolved || (fb.isResolved && fb.resolvedBy !== 'AUDITOR')
       ).length
+      // v4.1 修复1：rejectedCount 只算 resolvedAction='REJECTED' 的反馈（revise 时会被清掉）
       const rejectedCount = fieldFeedbacks.filter((fb: any) => fb.resolvedAction === 'REJECTED').length
       const lastResolvedAt = fieldFeedbacks
         .filter((fb: any) => fb.resolvedAt)
@@ -156,7 +159,7 @@ router.get('/workbench', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER, UserRo
           nextHandler = { type: 'DOCTOR', role: UserRole.CLINIC_DOCTOR, userId: r.submitterId, userName: r.submitter?.name }
       }
 
-      // 超期天数：PENDING_VERIFICATION/PENDING_AUDIT 超 3 天算超期，NEEDS_REVISION 超 2 天
+      // 超期天数
       let overdueDays = 0
       const verifyStatuses = [ReportStatus.PENDING_VERIFICATION, ReportStatus.PENDING_AUDIT, ReportStatus.REVISED, ReportStatus.IN_AUDIT] as string[]
       const overdueThreshold =
@@ -179,7 +182,7 @@ router.get('/workbench', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER, UserRo
       } as EnrichedReport
     })
 
-    // --- Step 4: 应用排序 ---
+    // --- Step 5: 全结果集排序（不是只排当前页）---
     const order = sortOrder === 'asc' ? 1 : -1
     enriched.sort((a: any, b: any) => {
       let av: any = null, bv: any = null
@@ -202,11 +205,17 @@ router.get('/workbench', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER, UserRo
       }
       if (av < bv) return -order
       if (av > bv) return order
+      // 第二排序：reportNo 稳定排序
+      if (a.reportNo < b.reportNo) return -1
+      if (a.reportNo > b.reportNo) return 1
       return 0
     })
 
-    // --- Step 5: 组装返回数据 ---
-    const list = enriched.map((r: any) => {
+    // --- Step 6: 从已排序的全量结果中取当前页 ---
+    const pageData = enriched.slice(skip, skip + size)
+
+    // --- Step 7: 组装当前页返回数据 ---
+    const list = pageData.map((r: any) => {
       const fieldFeedbacks = r.auditFeedbacks.filter((fb: any) => fb.fieldName != null)
       const totalField = fieldFeedbacks.length
       const verifiedApproved = fieldFeedbacks.filter(
@@ -235,13 +244,12 @@ router.get('/workbench', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER, UserRo
         categories: [...new Set(r.auditFeedbacks.map((fb: any) => fb.issueCategory))],
         updatedAt: r.updatedAt,
         createdAt: r.createdAt,
-        // 新增字段（v4）
         nextHandler: r._nextHandler,
         overdueDays: r._overdueDays,
       }
     })
 
-    // --- Step 6: overview 分类统计（与 WHERE 解耦，独立统计所有队列）---
+    // --- Step 8: overview 分类统计（与 WHERE 解耦，独立统计所有队列）---
     const [overviewCounts, rejectedStableCount] = await Promise.all([
       prisma.report.groupBy({
         by: ['status'],
@@ -255,7 +263,7 @@ router.get('/workbench', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER, UserRo
         ] } },
         _count: { status: true },
       }),
-      // 稳定的已退回数量统计
+      // v4.1 修复1：已退回数量严格与列表过滤条件一致
       prisma.report.count({
         where: {
           status: ReportStatus.NEEDS_REVISION,
@@ -278,7 +286,7 @@ router.get('/workbench', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER, UserRo
         pendingVerification: statusMap[ReportStatus.PENDING_VERIFICATION] || 0,
         rectified: statusMap[ReportStatus.RECTIFIED] || 0,
         pendingAudit: (statusMap[ReportStatus.PENDING_AUDIT] || 0) + (statusMap[ReportStatus.REVISED] || 0) + (statusMap[ReportStatus.IN_AUDIT] || 0),
-        rejected: rejectedStableCount,  // 稳定入口统计
+        rejected: rejectedStableCount,
         total: (statusMap[ReportStatus.NEEDS_REVISION] || 0) +
                (statusMap[ReportStatus.PENDING_VERIFICATION] || 0) +
                (statusMap[ReportStatus.RECTIFIED] || 0) +
@@ -710,6 +718,22 @@ router.put('/:id/revise', async (req: AuthRequest, res: Response) => {
       )
     }
 
+    // v4.1 修复1：医生重新提交时，把所有 resolvedAction=REJECTED 的反馈标记清掉
+    // （重新进入整改流程，不再算"已退回"）
+    await prisma.auditFeedback.updateMany({
+      where: {
+        reportId: report.id,
+        resolvedAction: 'REJECTED',
+      },
+      data: {
+        resolvedAction: null,
+        resolvedBy: null,
+        resolvedNote: null,
+        resolvedAt: null,
+        isResolved: false,
+      },
+    })
+
     const unresolvedFieldFeedbacks = await prisma.auditFeedback.count({
       where: { reportId: report.id, isResolved: false, fieldName: { not: null } },
     })
@@ -794,7 +818,7 @@ router.get('/', async (req: AuthRequest, res: Response) => {
         include: {
           clinic: { select: { id: true, name: true, code: true } },
           submitter: { select: { id: true, name: true } },
-          ruleChecks: { orderBy: { severity: 'desc' } },
+          ruleChecks: { orderBy: [{ severity: 'desc' }] },
           auditTasks: {
             include: {
               assignedTo: { select: { id: true, name: true } },
@@ -826,7 +850,7 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
       include: {
         clinic: { select: { id: true, name: true, code: true } },
         submitter: { select: { id: true, name: true, username: true } },
-        ruleChecks: { orderBy: { severity: 'desc', createdAt: 'desc' } },
+        ruleChecks: { orderBy: [{ severity: 'desc' }, { createdAt: 'desc' }] },
         auditTasks: {
           include: {
             assignedTo: { select: { id: true, name: true } },
@@ -970,27 +994,53 @@ router.post('/:id/rule-checks/rerun', requireRole(UserRole.QC_MANAGER, UserRole.
     newKeySet.forEach(k => { if (!oldKeySet.has(k)) newIssues.push(k) })
     oldKeySet.forEach(k => { if (!newKeySet.has(k)) removedIssues.push(k) })
     const changedCount = (newIssues.length > 0 || removedIssues.length > 0) ? 1 : 0
-
-    // 6) 更新批次统计 + 状态
     const hasErrors = issues.some(i => i.severity === RuleSeverity.ERROR && !i.passed)
-    const newStatus = hasErrors ? ReportStatus.RULE_CHECK_FAILED : ReportStatus.RULE_CHECK_PASSED
-    await Promise.all([
-      prisma.report.update({ where: { id: report.id }, data: { status: newStatus } }),
-      prisma.ruleRerunBatch.update({
-        where: { id: batch.id },
-        data: {
-          ruleSnapshot,
-          reportIds: JSON.stringify([report.id]),
-          affectedCount: 1,
-          newIssueCount: newIssues.length,
-          removedCount: removedIssues.length,
-          changedCount,
-        },
-      }),
-    ])
+
+    // 6) v4.1 修复4：复核中状态的报告不更新 status，只更新规则检查结果
+    const auditStatuses = [
+      ReportStatus.NEEDS_REVISION,
+      ReportStatus.PENDING_VERIFICATION,
+      ReportStatus.REVISED,
+      ReportStatus.PENDING_AUDIT,
+      ReportStatus.IN_AUDIT,
+      ReportStatus.AUDIT_APPROVED,
+      ReportStatus.AUDIT_REJECTED,
+      ReportStatus.RECTIFIED,
+    ] as string[]
+    const finalStatus: string = auditStatuses.includes(report.status)
+      ? report.status   // 保持原状态，不打断复核流程
+      : hasErrors ? ReportStatus.RULE_CHECK_FAILED : ReportStatus.RULE_CHECK_PASSED
+    const statusChanged = finalStatus !== report.status
+    if (statusChanged) {
+      await prisma.report.update({ where: { id: report.id }, data: { status: finalStatus } })
+    }
+
+    // 7) 批次持久化：包含完整 details（v4.1 修复3）
+    const details = [{
+      reportId: report.id,
+      reportNo: report.reportNo,
+      oldStatus: report.status,
+      newStatus: finalStatus,
+      statusPreserved: auditStatuses.includes(report.status),
+      newIssues,
+      removedIssues,
+    }]
+    await prisma.ruleRerunBatch.update({
+      where: { id: batch.id },
+      data: {
+        ruleSnapshot,
+        reportIds: JSON.stringify([report.id]),
+        details: JSON.stringify(details),
+        affectedCount: 1,
+        newIssueCount: newIssues.length,
+        removedCount: removedIssues.length,
+        changedCount,
+      },
+    })
 
     return res.json({
-      status: newStatus,
+      status: finalStatus,
+      statusPreserved: auditStatuses.includes(report.status),
       total: dbRecords.length,
       batchId: batch.id,
       batchNo,
@@ -1074,6 +1124,17 @@ router.post('/rule-checks/batch-rerun', requireRole(UserRole.QC_MANAGER), async 
     // 逐份处理
     let newIssueCount = 0, removedCount = 0, changedCount = 0
     const affectedDetail: any[] = []
+    // v4.1 修复4：复核中状态不打断
+    const auditStatuses = [
+      ReportStatus.NEEDS_REVISION,
+      ReportStatus.PENDING_VERIFICATION,
+      ReportStatus.REVISED,
+      ReportStatus.PENDING_AUDIT,
+      ReportStatus.IN_AUDIT,
+      ReportStatus.AUDIT_APPROVED,
+      ReportStatus.AUDIT_REJECTED,
+      ReportStatus.RECTIFIED,
+    ] as string[]
 
     for (const rpt of candidateReports as any[]) {
       const report = await prisma.report.findUnique({ where: { id: rpt.id } })
@@ -1087,7 +1148,6 @@ router.post('/rule-checks/batch-rerun', requireRole(UserRole.QC_MANAGER), async 
       const { issues, configs } = await runAllRules(report as any, { useConfigs: true })
       const ruleSnapshot = (batch as any).ruleSnapshot || configs ? JSON.stringify(configs) : null
       if (!(batch as any).ruleSnapshot) {
-        // 仅在第一次存快照，保证整批次使用同一快照
         await prisma.ruleRerunBatch.update({ where: { id: batch.id }, data: { ruleSnapshot } })
       }
       const dbRecords = issuesToDbRecords(report.id, issues, { ruleSnapshot, batchId: batch.id })
@@ -1103,24 +1163,36 @@ router.post('/rule-checks/batch-rerun', requireRole(UserRole.QC_MANAGER), async 
       oldKeySet.forEach(k => { if (!newKeySet.has(k)) removedList.push(k) })
       newIssueCount += newList.length
       removedCount += removedList.length
-      if (newList.length > 0 || removedList.length > 0) {
-        changedCount++
-        affectedDetail.push({
-          reportId: rpt.id, reportNo: rpt.reportNo,
-          newIssues: newList, removedIssues: removedList,
-          oldStatus: rpt.status,
-        })
+      const hasErrors = issues.some(i => i.severity === RuleSeverity.ERROR && !i.passed)
+      const reportNewStatus: string = auditStatuses.includes(report.status)
+        ? report.status
+        : hasErrors ? ReportStatus.RULE_CHECK_FAILED : ReportStatus.RULE_CHECK_PASSED
+      const statusChanged = reportNewStatus !== report.status
+      if (statusChanged) {
+        await prisma.report.update({ where: { id: report.id }, data: { status: reportNewStatus } })
       }
 
-      // 更新报告状态
-      const hasErrors = issues.some(i => i.severity === RuleSeverity.ERROR && !i.passed)
-      const newStatus = hasErrors ? ReportStatus.RULE_CHECK_FAILED : ReportStatus.RULE_CHECK_PASSED
-      await prisma.report.update({ where: { id: report.id }, data: { status: newStatus } })
+      if (newList.length > 0 || removedList.length > 0) {
+        changedCount++
+      }
+      affectedDetail.push({
+        reportId: rpt.id, reportNo: rpt.reportNo,
+        oldStatus: rpt.status,
+        newStatus: reportNewStatus,
+        statusPreserved: auditStatuses.includes(report.status),
+        newIssues: newList,
+        removedIssues: removedList,
+      })
     }
 
     await prisma.ruleRerunBatch.update({
       where: { id: batch.id },
-      data: { newIssueCount, removedCount, changedCount },
+      data: {
+        newIssueCount,
+        removedCount,
+        changedCount,
+        details: JSON.stringify(affectedDetail),  // v4.1 修复3：持久化完整差异
+      },
     })
 
     return res.json({
@@ -1191,7 +1263,12 @@ router.get('/rule-checks/batches/:id', requireRole(UserRole.ADMIN, UserRole.QC_M
     let reportIds: string[] = []
     try { reportIds = batch.reportIds ? JSON.parse(batch.reportIds) : [] } catch {}
 
-    // 汇总影响的报告（及其这次规则检查结果 vs 上次的差异）
+    // v4.1 修复3：读取持久化的差异明细
+    let details: any[] = []
+    try { details = batch.details ? JSON.parse(batch.details) : [] } catch {}
+    const detailsByReport = new Map(details.map((d: any) => [d.reportId, d]))
+
+    // 汇总影响的报告（及其这次规则检查结果）
     const reports = await prisma.report.findMany({
       where: { id: { in: reportIds.slice(0, 200) } },
       include: {
@@ -1214,14 +1291,26 @@ router.get('/rule-checks/batches/:id', requireRole(UserRole.ADMIN, UserRole.QC_M
         ruleSnapshot: batch.ruleSnapshot ? JSON.parse(batch.ruleSnapshot) : null,
       },
       reportCount: reportIds.length,
-      reports: reports.map(r => ({
-        id: r.id, reportNo: r.reportNo, type: r.type,
-        status: r.status,
-        clinic: r.clinic, submitter: r.submitter,
-        ruleChecks: r.ruleChecks,
-        errorCount: r.ruleChecks.filter(c => !c.passed && c.severity === 'ERROR').length,
-        warningCount: r.ruleChecks.filter(c => !c.passed && c.severity === 'WARNING').length,
-      })),
+      reports: reports.map(r => {
+        const d = detailsByReport.get(r.id) || {}
+        return {
+          id: r.id, reportNo: r.reportNo, type: r.type,
+          status: r.status,
+          oldStatus: d.oldStatus,
+          newStatus: d.newStatus,
+          statusPreserved: !!d.statusPreserved,
+          clinic: r.clinic, submitter: r.submitter,
+          ruleChecks: r.ruleChecks,
+          errorCount: r.ruleChecks.filter((c: any) => !c.passed && c.severity === 'ERROR').length,
+          warningCount: r.ruleChecks.filter((c: any) => !c.passed && c.severity === 'WARNING').length,
+          // 直接带上新增/消失问题（v4.1 修复3）
+          diff: {
+            newIssues: d.newIssues || [],
+            removedIssues: d.removedIssues || [],
+            changed: (d.newIssues?.length || 0) + (d.removedIssues?.length || 0) > 0,
+          },
+        }
+      }),
     })
   } catch (err) {
     console.error(err)

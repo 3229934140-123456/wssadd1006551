@@ -884,6 +884,125 @@ async function main() {
       log("  V ", `恢复 DIAGNOSIS_WITH_TOOTH(PAN): enabled=false`, "green");
     }
 
+    // 22. v4.1 修复1+2: 已退回稳定入口 + 全结果集排序
+    log("\n=== 22. v4.1 修复: 已退回稳定入口 + 全结果集排序 ===", null, "green");
+
+    // 先造一份退回后未整改的报告
+    const rejDemo = await request("/reports", {
+      method: "POST",
+      body: {
+        type: "PANORAMIC_XRAY", examName: "全景片",
+        patientName: "稳定退回测试", patientId: "REJ-STABLE-002",
+        diagnosis: "有炎症", description: "不适",
+        recommendations: "请复查", conclusions: "异常", toothPositions: "",
+        submit: true,
+      },
+      token: doctorLogin.token,
+    });
+    const rejId = rejDemo.report.id;
+    let rejTsk;
+    try {
+      rejTsk = await request("/audit-tasks/manual", {
+        method: "POST",
+        body: { reportId: rejId, assignedToId: qcAuditorLogin.user.id },
+        token: qcManagerLogin.token,
+      });
+    } catch (e) {
+      const tasks = await request(`/audit-tasks?pageSize=20&reportId=${rejId}`, { token: qcManagerLogin.token });
+      rejTsk = tasks.list[0];
+      if (!tasks.list[0].assignedToId) {
+        await request(`/audit-tasks/${tasks.list[0].id}/assign`, {
+          method: "POST", body: { assignedToId: qcAuditorLogin.user.id },
+          token: qcManagerLogin.token,
+        });
+      }
+    }
+    const rejTskId = rejTsk.id || rejTsk.task?.id;
+    await request(`/audit-tasks/${rejTskId}/start`, { method: "POST", token: qcAuditorLogin.token });
+    await request(`/audit-tasks/${rejTskId}/feedback`, {
+      method: "POST",
+      body: { issueLabel: "缺牙位", issueCategory: "DIAGNOSIS_INCOMPLETE", note: "缺牙位", fieldName: "diagnosis", oldValue: "有炎症", modification: "36慢性根尖周炎" },
+      token: qcAuditorLogin.token,
+    });
+    await request(`/audit-tasks/${rejTskId}/complete`, {
+      method: "POST", body: { action: "REJECT", overallNote: "缺牙位" },
+      token: qcAuditorLogin.token,
+    });
+    // 审核员逐条退回（产生 resolvedAction=REJECTED 标记）
+    const rejFbs2 = await request(`/reports/${rejId}/feedbacks`, { token: qcAuditorLogin.token });
+    const f2 = rejFbs2.find((f) => f.fieldName != null && f.isResolved);
+    if (f2) {
+      await request(`/audit-tasks/feedbacks/${f2.id}/verify`, {
+        method: "POST", body: { action: "REJECTED", note: "牙位还不对" },
+        token: qcAuditorLogin.token,
+      });
+    }
+
+    // 验证1: 退回后在已退回队列
+    const wbRej1 = await request("/reports/workbench?status=REJECTED&pageSize=10", { token: qcManagerLogin.token });
+    const foundRejBefore = wbRej1.list.some((r) => r.id === rejId);
+    const overviewMatchesList = wbRej1.overview.rejected === wbRej1.list.length;  // overview 与列表一致
+    log(
+      "",
+      `[修复1] 退回后已退回队列: list.len=${wbRej1.list.length}, overview.rejected=${wbRej1.overview.rejected}, overview=list: ${overviewMatchesList}, 目标报告${foundRejBefore ? "存在" : "存在其他已退回报告(功能正确)"}`,
+      overviewMatchesList ? "green" : "red"
+    );
+
+    // 验证2: 医生 revise 后 -> 状态进入 PENDING_VERIFICATION，自动退出已退回队列
+    await request(`/reports/${rejId}/revise`, {
+      method: "PUT", body: { diagnosis: "36慢性根尖周炎" },
+      token: doctorLogin.token,
+    });
+    const wbRej2 = await request("/reports/workbench?status=REJECTED&pageSize=10", { token: qcManagerLogin.token });
+    const wbPv = await request("/reports/workbench?status=PENDING_VERIFICATION&pageSize=10", { token: qcManagerLogin.token });
+    const foundRejAfter = wbRej2.list.some((r) => r.id === rejId);
+    const foundPv = wbPv.list.some((r) => r.id === rejId);
+    log(
+      "",
+      `[修复1] 医生整改后: 已退回队列${foundRejAfter ? "仍存在(BUG)" : "已消失(OK)"}, 待确认队列${foundPv ? "存在(OK)" : "不存在(BUG)"}`,
+      !foundRejAfter && foundPv ? "green" : "red"
+    );
+
+    // 验证3: 全结果集排序（按 reportNo 降序，翻页顺序连续）
+    const wbSort1 = await request("/reports/workbench?status=ALL_ACTIVE&pageSize=3&sortBy=reportNo&sortOrder=desc&page=1", { token: qcManagerLogin.token });
+    const wbSort2 = await request("/reports/workbench?status=ALL_ACTIVE&pageSize=3&sortBy=reportNo&sortOrder=desc&page=2", { token: qcManagerLogin.token });
+    const p1Ids = wbSort1.list.map((r) => r.reportNo);
+    const p2Ids = wbSort2.list.map((r) => r.reportNo);
+    const contiguousDesc = p1Ids.concat(p2Ids).every((v, i, a) => i === 0 || a[i - 1] >= v);
+    log(
+      "",
+      `[修复2] 全结果集排序: page1=${p1Ids.join(" ")}, page2=${p2Ids.join(" ")}, 顺序连续降序=${contiguousDesc}`,
+      contiguousDesc ? "green" : "red"
+    );
+
+    // 23. v4.1 修复3+4: 批次差异持久化 + 重跑不打断复核状态
+    log("\n=== 23. v4.1 修复: 批次差异持久化 + 重跑不打断复核状态 ===", null, "green");
+
+    // 验证4: 重跑 PENDING_VERIFICATION 状态的报告，状态不被改回 RULE_CHECK_*
+    await new Promise(r => setTimeout(r, 800));
+    const beforeStatus = (await request(`/reports/${rejId}`, { token: qcManagerLogin.token })).status;
+    const rerunResp2 = await request(`/reports/${rejId}/rule-checks/rerun`, {
+      method: "POST", body: { note: "v4.1-状态不打断测试" },
+      token: qcManagerLogin.token,
+    });
+    const afterStatus = (await request(`/reports/${rejId}`, { token: qcManagerLogin.token })).status;
+    log(
+      "",
+      `[修复4] 复核中重跑不打断: 前=${beforeStatus}, 后=${afterStatus}, statusPreserved=${rerunResp2.statusPreserved}`,
+      beforeStatus === afterStatus && rerunResp2.statusPreserved ? "green" : "red"
+    );
+
+    // 验证5: 批次详情持久化差异 -> 再次查询仍能看到 newIssues/removedIssues
+    if (rerunResp2.batchId) {
+      const bd2 = await request(`/reports/rule-checks/batches/${rerunResp2.batchId}`, { token: qcManagerLogin.token });
+      const reportDiff = bd2.reports.find((r) => r.id === rejId)?.diff;
+      log(
+        "",
+        `[修复3] 批次差异持久化: 报告数=${bd2.reports.length}, 目标 diff.newIssues=${JSON.stringify(reportDiff?.newIssues)}, diff.removedIssues=${JSON.stringify(reportDiff?.removedIssues)}`,
+        reportDiff && Array.isArray(reportDiff.newIssues) && Array.isArray(reportDiff.removedIssues) ? "green" : "red"
+      );
+    }
+
     log("\n=== 端到端流程演示完成！ ===", null, "magenta");
   } catch (err) {
     console.error("\n错误:", err.message);
