@@ -24,6 +24,7 @@ export const ReportStatus = {
   AUDIT_REJECTED: 'AUDIT_REJECTED',
   NEEDS_REVISION: 'NEEDS_REVISION',
   REVISED: 'REVISED',
+  PENDING_VERIFICATION: 'PENDING_VERIFICATION',
   RECTIFIED: 'RECTIFIED',
 } as const
 export type ReportStatus = (typeof ReportStatus)[keyof typeof ReportStatus]

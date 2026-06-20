@@ -43,6 +43,7 @@ model User {
   samplingRulesAsCreator    SamplingRule[] @relation("SamplingRuleCreator")
   ruleConfigsAsCreator      RuleConfig[] @relation("RuleConfigCreator")
   samplingRunsAsTrigger     SamplingRun[] @relation("SamplingRunTrigger")
+  ruleConfigChangesAsChanger RuleConfigChangeLog[] @relation("RuleConfigChangeLogChanger")
 }
 
 model Report {
@@ -85,6 +86,7 @@ model RuleCheckResult {
   message     String
   fieldName   String?
   suggestion  String?
+  ruleSnapshot String?
   createdAt   DateTime @default(now())
 
   report      Report   @relation(fields: [reportId], references: [id])
@@ -168,8 +170,28 @@ model RuleConfig {
   updatedAt   DateTime @updatedAt
 
   createdBy   User     @relation("RuleConfigCreator", fields: [createdById], references: [id])
+  changeLogs  RuleConfigChangeLog[]
 
   @@unique([ruleCode, reportType], name: "RuleConfigRuleCodeReportTypeKey")
+}
+
+model RuleConfigChangeLog {
+  id              String   @id @default(uuid())
+  ruleConfigId    String
+  ruleCode        String
+  reportType      String?
+  fieldName       String
+  oldValue        String?
+  newValue        String?
+  changedById     String
+  createdAt       DateTime @default(now())
+
+  ruleConfig      RuleConfig @relation(fields: [ruleConfigId], references: [id])
+  changedBy       User       @relation("RuleConfigChangeLogChanger", fields: [changedById], references: [id])
+
+  @@index([ruleConfigId])
+  @@index([ruleCode, reportType])
+  @@index([changedById])
 }
 
 model SamplingRun {

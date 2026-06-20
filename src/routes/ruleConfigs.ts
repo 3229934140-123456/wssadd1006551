@@ -12,6 +12,29 @@ import {
 
 const router = Router()
 router.use(authenticate)
+router.use(requireRole(UserRole.ADMIN, UserRole.QC_MANAGER))
+
+async function recordRuleConfigChange(
+  ruleConfigId: string,
+  ruleCode: string,
+  reportType: string | null,
+  fieldName: string,
+  oldValue: string | boolean | null,
+  newValue: string | boolean | null,
+  changedById: string,
+) {
+  await prisma.ruleConfigChangeLog.create({
+    data: {
+      ruleConfigId,
+      ruleCode,
+      reportType,
+      fieldName,
+      oldValue: oldValue !== null ? String(oldValue) : null,
+      newValue: newValue !== null ? String(newValue) : null,
+      changedById,
+    },
+  })
+}
 
 function getRuleMetaList(): {
   ruleCode: RuleCode
@@ -110,6 +133,13 @@ router.post('/', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER), async (req: A
     })
     const def = RuleDefinitions[body.ruleCode as RuleCode]
     if (existing) {
+      const changes: { field: string; old: any; new: any }[] = []
+      if (existing.enabled !== body.enabled) {
+        changes.push({ field: 'enabled', old: existing.enabled, new: body.enabled })
+      }
+      if (existing.severity !== body.severity) {
+        changes.push({ field: 'severity', old: existing.severity, new: body.severity })
+      }
       const updated = await prisma.ruleConfig.update({
         where: { id: existing.id },
         data: {
@@ -119,6 +149,12 @@ router.post('/', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER), async (req: A
         },
         include: { createdBy: { select: { id: true, name: true } } },
       })
+      await Promise.all(changes.map(c =>
+        recordRuleConfigChange(
+          existing.id, body.ruleCode, body.reportType ?? null,
+          c.field, c.old, c.new, req.user!.userId,
+        )
+      ))
       return res.json(updated)
     }
     const created = await prisma.ruleConfig.create({
@@ -132,6 +168,12 @@ router.post('/', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER), async (req: A
       },
       include: { createdBy: { select: { id: true, name: true } } },
     })
+    await Promise.all([
+      recordRuleConfigChange(created.id, body.ruleCode, body.reportType ?? null,
+        'enabled', null, body.enabled, req.user!.userId),
+      recordRuleConfigChange(created.id, body.ruleCode, body.reportType ?? null,
+        'severity', null, body.severity, req.user!.userId),
+    ])
     return res.status(201).json(created)
   } catch (err) {
     if (err instanceof z.ZodError) {
@@ -153,6 +195,19 @@ router.post('/bulk', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER), async (re
         return res.status(400).json({ error: `无效的检查类型: ${item.reportType}` })
       }
     }
+    // 先查出所有现有配置用于比较变更
+    const existingConfigs = await prisma.ruleConfig.findMany({
+      where: {
+        OR: body.map(item => ({
+          ruleCode: item.ruleCode,
+          reportType: item.reportType ?? null,
+        })),
+      },
+    })
+    const existingMap = new Map(
+      existingConfigs.map(c => [`${c.ruleCode}|${c.reportType || 'GLOBAL'}`, c])
+    )
+
     const results = await prisma.$transaction(
       body.map(item => {
         const def = RuleDefinitions[item.ruleCode as RuleCode]
@@ -179,6 +234,40 @@ router.post('/bulk', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER), async (re
         })
       })
     )
+
+    // 写入变更日志
+    const changePromises: Promise<any>[] = []
+    for (let i = 0; i < body.length; i++) {
+      const item = body[i]
+      const result = results[i]
+      const existing = existingMap.get(`${item.ruleCode}|${(item.reportType || 'GLOBAL')}`)
+      if (!existing) {
+        // 新建，记录初始值
+        changePromises.push(recordRuleConfigChange(
+          result.id, item.ruleCode, item.reportType ?? null,
+          'enabled', null, item.enabled, req.user!.userId,
+        ))
+        changePromises.push(recordRuleConfigChange(
+          result.id, item.ruleCode, item.reportType ?? null,
+          'severity', null, item.severity, req.user!.userId,
+        ))
+      } else {
+        if (existing.enabled !== item.enabled) {
+          changePromises.push(recordRuleConfigChange(
+            result.id, item.ruleCode, item.reportType ?? null,
+            'enabled', existing.enabled, item.enabled, req.user!.userId,
+          ))
+        }
+        if (existing.severity !== item.severity) {
+          changePromises.push(recordRuleConfigChange(
+            result.id, item.ruleCode, item.reportType ?? null,
+            'severity', existing.severity, item.severity, req.user!.userId,
+          ))
+        }
+      }
+    }
+    await Promise.all(changePromises)
+
     return res.json({ updated: results.length, list: results })
   } catch (err) {
     if (err instanceof z.ZodError) {
@@ -197,16 +286,58 @@ router.put('/:id', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER), async (req:
     const data: any = {}
     if (body.enabled !== undefined) data.enabled = body.enabled
     if (body.severity) data.severity = body.severity
+
+    const changes: { field: string; old: any; new: any }[] = []
+    if (body.enabled !== undefined && existing.enabled !== body.enabled) {
+      changes.push({ field: 'enabled', old: existing.enabled, new: body.enabled })
+    }
+    if (body.severity && existing.severity !== body.severity) {
+      changes.push({ field: 'severity', old: existing.severity, new: body.severity })
+    }
+
     const updated = await prisma.ruleConfig.update({
       where: { id: req.params.id },
       data,
       include: { createdBy: { select: { id: true, name: true } } },
     })
+    await Promise.all(changes.map(c =>
+      recordRuleConfigChange(
+        existing.id, existing.ruleCode, existing.reportType,
+        c.field, c.old, c.new, req.user!.userId,
+      )
+    ))
     return res.json(updated)
   } catch (err) {
     if (err instanceof z.ZodError) {
       return res.status(400).json({ error: '参数验证失败', details: err.errors })
     }
+    console.error(err)
+    return res.status(500).json({ error: '服务器内部错误' })
+  }
+})
+
+router.get('/:id/changelogs', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER), async (req: AuthRequest, res: Response) => {
+  try {
+    const { page = '1', pageSize = '50' } = req.query
+    const pageNum = Math.max(1, parseInt(page as string))
+    const size = Math.min(200, Math.max(1, parseInt(pageSize as string)))
+    const skip = (pageNum - 1) * size
+
+    const [total, logs] = await Promise.all([
+      prisma.ruleConfigChangeLog.count({ where: { ruleConfigId: req.params.id } }),
+      prisma.ruleConfigChangeLog.findMany({
+        where: { ruleConfigId: req.params.id },
+        skip,
+        take: size,
+        include: {
+          changedBy: { select: { id: true, name: true, username: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+      }),
+    ])
+
+    return res.json({ total, page: pageNum, pageSize: size, list: logs })
+  } catch (err) {
     console.error(err)
     return res.status(500).json({ error: '服务器内部错误' })
   }

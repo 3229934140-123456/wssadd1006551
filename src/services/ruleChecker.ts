@@ -20,6 +20,7 @@ export type RuleCheckResultShape = {
   message: string
   fieldName?: string | null
   suggestion?: string | null
+  ruleSnapshot?: string | null
 }
 
 export interface RuleCheckIssue {
@@ -319,7 +320,7 @@ export function applyRuleConfigs(
 export async function runAllRules(
   report: ReportShape,
   opts?: { useConfigs?: boolean },
-): Promise<RuleCheckIssue[]> {
+): Promise<{ issues: RuleCheckIssue[]; configs: EffectiveRuleConfig[] | null }> {
   const issues = [
     checkExamName(report),
     checkExamNameStandard(report),
@@ -331,15 +332,18 @@ export async function runAllRules(
   ]
   if (opts?.useConfigs) {
     const configs = await loadEffectiveRuleConfigs(report.type)
-    return applyRuleConfigs(issues, configs)
+    const effectiveIssues = applyRuleConfigs(issues, configs)
+    return { issues: effectiveIssues, configs }
   }
-  return issues
+  return { issues, configs: null }
 }
 
 export function issuesToDbRecords(
   reportId: string,
   issues: RuleCheckIssue[],
+  opts?: { ruleSnapshot?: string | null },
 ): RuleCheckResultShape[] {
+  const ruleSnapshot = opts?.ruleSnapshot ?? null
   return issues.map(issue => ({
     reportId,
     ruleCode: issue.ruleCode,
@@ -349,5 +353,6 @@ export function issuesToDbRecords(
     message: issue.message,
     fieldName: issue.fieldName,
     suggestion: issue.suggestion,
+    ruleSnapshot,
   }))
 }

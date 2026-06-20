@@ -121,15 +121,21 @@ export async function generateDailyTasks(
   try {
     for (const report of reports) {
       const hasExisting = existingReportIds.has(report.id)
-      if (hasExisting && !regenerateExisting) {
+      if (hasExisting) {
+        // 无论 regenerateExisting 是什么值，同日同报告已有待审任务时都不再新建
+        // 只在 SamplingRunItem 中标记为沿用已有任务，避免待办越刷越多
         skippedCount++
         const existingTask = existingTaskByReport.get(report.id)!
+        // 重新计算 rate 和 matchedRule 用于记录命中了哪条比例规则
+        const { rate, auditorId, matchedRule } = getEffectiveSamplingRate(report, rules)
         details.push({
           reportId: report.id,
           reportNo: report.reportNo,
-          rate: 0,
+          rate,
           selected: true,
           existingTask: true,
+          matchedRuleId: matchedRule?.id ?? null,
+          matchedRuleName: matchedRule?.name ?? null,
           taskId: existingTask.id,
           assignedToId: existingTask.assignedToId,
           priority: existingTask.priority,
@@ -142,9 +148,11 @@ export async function generateDailyTasks(
             clinicId: report.clinicId,
             submitterId: report.submitterId,
             reportType: report.type,
-            samplingRate: 0,
+            samplingRate: rate,
             selected: true,
             existingTask: true,
+            matchedRuleId: matchedRule?.id ?? null,
+            matchedRuleName: matchedRule?.name ?? null,
             assignedToId: existingTask.assignedToId,
             priority: existingTask.priority,
           })

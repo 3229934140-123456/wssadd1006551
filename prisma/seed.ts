@@ -319,7 +319,7 @@ async function main() {
       },
     })
 
-    const issues = await runAllRules(report as any)
+    const { issues } = await runAllRules(report as any)
     const dbRecords = issuesToDbRecords(report.id, issues)
     await prisma.ruleCheckResult.createMany({ data: dbRecords })
 

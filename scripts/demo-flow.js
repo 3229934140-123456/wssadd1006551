@@ -429,9 +429,258 @@ async function main() {
       );
       if (verifyResp.reportStatus === "RECTIFIED") break;
     }
-    if (lastVerifyResp && lastVerifyResp.reportStatus === "RECTIFIED") {
-      log("", `🎉 所有具体问题审核确认通过，报告状态自动变为 RECTIFIED (总评 autoApproved=${lastVerifyResp.autoApprovedOverall || 0})`, "green");
+    // 16. 两阶段整改复核: 医生改完进入 PENDING_VERIFICATION，审核员逐条确认后才闭环
+    log("\n=== 16. 两阶段整改复核 (PENDING_VERIFICATION -> 逐条确认 -> RECTIFIED) ===", null, "green");
+
+    // 先创建一份新报告，走完审核打回流程
+    const reviseDemoResp = await request("/reports", {
+      method: "POST",
+      body: {
+        type: "PANORAMIC_XRAY",
+        examName: "全景片",
+        patientName: "复核演示患者",
+        patientId: "DEMO-VERIFY-001",
+        description: "后牙不适",
+        diagnosis: "有炎症",
+        conclusions: "有问题",
+        recommendations: "请结合临床",
+        toothPositions: "",
+        submit: true,
+      },
+      token: doctorLogin.token,
+    });
+    const verifyDemoReportId = reviseDemoResp.report.id;
+    log("", `提交报告 ID: ${verifyDemoReportId.slice(0, 8)}...`, "cyan");
+
+    // 手动创建审核任务并打回
+    let manualTask;
+    try {
+      manualTask = await request("/audit-tasks/manual", {
+        method: "POST",
+        body: { reportId: verifyDemoReportId, assignedToId: qcAuditorLogin.user.id },
+        token: qcManagerLogin.token,
+      });
+    } catch (e) {
+      const tasks = await request(`/audit-tasks?pageSize=20&reportId=${verifyDemoReportId}`, {
+        token: qcManagerLogin.token,
+      });
+      manualTask = tasks.list[0];
+      if (!manualTask.assignedToId) {
+        manualTask = await request(`/audit-tasks/${manualTask.id}/assign`, {
+          method: "POST",
+          body: { assignedToId: qcAuditorLogin.user.id },
+          token: qcManagerLogin.token,
+        });
+      }
     }
+    const verifyTaskId = manualTask.id;
+    log("", `创建任务并分配给审核员, 任务 ID: ${verifyTaskId.slice(0, 8)}...`, "cyan");
+
+    await request(`/audit-tasks/${verifyTaskId}/start`, { method: "POST", token: qcAuditorLogin.token });
+    await request(`/audit-tasks/${verifyTaskId}/feedback`, {
+      method: "POST",
+      body: {
+        issueLabel: "只写炎症没写牙位",
+        issueCategory: "DIAGNOSIS_INCOMPLETE",
+        note: "请补充具体牙位，如36、37",
+        modification: "36,37",
+        fieldName: "diagnosis",
+        oldValue: "有炎症",
+      },
+      token: qcAuditorLogin.token,
+    });
+    await request(`/audit-tasks/${verifyTaskId}/feedback`, {
+      method: "POST",
+      body: {
+        issueLabel: "未使用FDI编号",
+        issueCategory: "TOOTH_POSITION_FORMAT",
+        note: "牙位字段需使用FDI编号",
+        modification: "36,37",
+        fieldName: "toothPositions",
+        oldValue: "",
+      },
+      token: qcAuditorLogin.token,
+    });
+    await request(`/audit-tasks/${verifyTaskId}/complete`, {
+      method: "POST",
+      body: { action: "REJECT", overallNote: "请补充牙位信息" },
+      token: qcAuditorLogin.token,
+    });
+    log("", `审核打回完成, 报告进入 NEEDS_REVISION`, "yellow");
+
+    // 医生提交整改 -> 进入 PENDING_VERIFICATION
+    const reviseResp2 = await request(`/reports/${verifyDemoReportId}/revise`, {
+      method: "PUT",
+      body: {
+        diagnosis: "36慢性根尖周炎",
+        toothPositions: "36",
+      },
+      token: doctorLogin.token,
+    });
+    log(
+      "",
+      `医生提交整改后, 报告状态: ${reviseResp2.report.status} (预期 PENDING_VERIFICATION)`,
+      reviseResp2.report.status === "PENDING_VERIFICATION" ? "green" : "red"
+    );
+
+    // 审核员逐条确认：第一条 APPROVED，第二条 REJECTED
+    const feedbacksV2 = await request(`/reports/${verifyDemoReportId}/feedbacks`, { token: qcAuditorLogin.token });
+    const fieldFbsV2 = feedbacksV2.filter((f) => f.fieldName != null);
+    log("", `待确认反馈 ${fieldFbsV2.length} 条`, "cyan");
+
+    // 第一条确认通过
+    const verify1 = await request(`/audit-tasks/feedbacks/${fieldFbsV2[0].id}/verify`, {
+      method: "POST",
+      body: { action: "APPROVED", note: "牙位已补充" },
+      token: qcAuditorLogin.token,
+    });
+    log(
+      "  V ",
+      `反馈1 APPROVED, 剩余待确认: ${verify1.remainingUnverified}`,
+      "cyan"
+    );
+
+    // 第二条退回 -> 报告回到 NEEDS_REVISION
+    const verify2 = await request(`/audit-tasks/feedbacks/${fieldFbsV2[1].id}/verify`, {
+      method: "POST",
+      body: { action: "REJECTED", note: "牙位37也需要补充，不只36" },
+      token: qcAuditorLogin.token,
+    });
+    log(
+      "  X ",
+      `反馈2 REJECTED, 报告状态: ${verify2.action === "REJECTED" ? "NEEDS_REVISION" : "?"} (医生需继续改)`,
+      "yellow"
+    );
+
+    // 医生再次修改 -> PENDING_VERIFICATION
+    const reviseResp3 = await request(`/reports/${verifyDemoReportId}/revise`, {
+      method: "PUT",
+      body: {
+        diagnosis: "36慢性根尖周炎，37深龋",
+        toothPositions: "36,37",
+      },
+      token: doctorLogin.token,
+    });
+    log(
+      "",
+      `医生再次整改后, 状态: ${reviseResp3.report.status} (预期 PENDING_VERIFICATION)`,
+      reviseResp3.report.status === "PENDING_VERIFICATION" ? "green" : "red"
+    );
+
+    // 审核员全部确认通过 -> 闭环 RECTIFIED
+    const feedbacksV3 = await request(`/reports/${verifyDemoReportId}/feedbacks`, { token: qcAuditorLogin.token });
+    const fieldFbsV3 = feedbacksV3.filter((f) => f.fieldName != null && f.isResolved && f.resolvedBy === "DOCTOR");
+    for (let i = 0; i < fieldFbsV3.length; i++) {
+      const vResp = await request(`/audit-tasks/feedbacks/${fieldFbsV3[i].id}/verify`, {
+        method: "POST",
+        body: { action: "APPROVED", note: `确认通过 ${i + 1}` },
+        token: qcAuditorLogin.token,
+      });
+      log(
+        "  V ",
+        `确认 ${i + 1}/${fieldFbsV3.length}: ${vResp.reportStatus || `剩余${vResp.remainingUnverified}`}`,
+        vResp.reportStatus === "RECTIFIED" ? "green" : "cyan"
+      );
+      if (vResp.reportStatus === "RECTIFIED") break;
+    }
+
+    // 17. 复核工作台
+    log("\n=== 17. 复核工作台: 多维度筛选 + 状态统计 ===", null, "green");
+
+    const wb = await request("/reports/workbench?page=1&pageSize=5", { token: qcManagerLogin.token });
+    log(
+      "",
+      `工作台统计: 共${wb.overview.total}份 / 待整改${wb.overview.needsRevision} / 待确认${wb.overview.pendingVerification} / 已退回${wb.overview.rejected} / 已闭环${wb.overview.rectified}`,
+      "cyan"
+    );
+    log("", `列表 ${wb.list.length} 份，展示前3份：`, "cyan");
+    wb.list.slice(0, 3).forEach((r) => {
+      const stColor = r.status === "PENDING_VERIFICATION" ? "yellow" : r.status === "RECTIFIED" ? "green" : "gray";
+      log(
+        `  - `,
+        `${r.reportNo} | ${r.status} | 待确认${r.feedbackStats.pendingVerification} / 已退回${r.feedbackStats.rejected} | 最近整改 ${new Date(r.lastRevisedAt).toLocaleString().slice(0, 10)}`,
+        stColor
+      );
+    });
+
+    // 18. 抽检重生成防重复
+    log("\n=== 18. 抽检重生成防重复: 同日同报告不重复创建 ===", null, "green");
+
+    const gen1 = await request("/audit-tasks/generate-daily", {
+      method: "POST",
+      body: { regenerateExisting: true, note: "测试防重复-第1次" },
+      token: qcManagerLogin.token,
+    });
+    log(
+      "",
+      `第1次生成: total=${gen1.totalReports}, created=${gen1.createdTasks}, skipped=${gen1.skippedTasks}`,
+      "cyan"
+    );
+
+    const gen2 = await request("/audit-tasks/generate-daily", {
+      method: "POST",
+      body: { regenerateExisting: true, note: "测试防重复-第2次" },
+      token: qcManagerLogin.token,
+    });
+    log(
+      "",
+      `第2次生成: total=${gen2.totalReports}, created=${gen2.createdTasks}, skipped=${gen2.skippedTasks} (预期 skipped = 第1次 created)`,
+      gen2.skippedTasks > 0 ? "green" : "yellow"
+    );
+
+    const runDetail = await request(`/sampling-runs/${gen2.runId}`, { token: qcManagerLogin.token });
+    log(
+      "",
+      `第2次运行明细: 已存在任务=${runDetail.stats.existingCount}, 新抽中=${runDetail.stats.newCreatedCount}, 选中总计=${runDetail.stats.selectedCount}`,
+      runDetail.stats.existingCount > 0 ? "green" : "yellow"
+    );
+
+    // 19. 规则变更记录 + 规则快照
+    log("\n=== 19. 规则变更记录 + 规则快照追溯 ===", null, "green");
+
+    const rcList = await request("/rule-configs", { token: qcManagerLogin.token });
+    const toothRule = rcList.list.find(
+      (c) => c.ruleCode === "TOOTH_POSITION_FORMAT" && c.reportType === "PANORAMIC_XRAY"
+    );
+    log("", `目标规则: TOOTH_POSITION_FORMAT(PAN), current ID: ${toothRule.id.slice(0, 8)}...`, "cyan");
+
+    // 改规则
+    await request(`/rule-configs/${toothRule.id}`, {
+      method: "PUT",
+      body: { enabled: false, severity: "WARNING" },
+      token: qcManagerLogin.token,
+    });
+    log("  V ", `修改规则: enabled=false, severity=WARNING`, "cyan");
+
+    // 查变更日志
+    const cl = await request(`/rule-configs/${toothRule.id}/changelogs?pageSize=10`, { token: qcManagerLogin.token });
+    log("", `变更记录共 ${cl.total} 条, 最近 2 条:`, "cyan");
+    cl.list.slice(0, 2).forEach((l) => {
+      log(
+        `  - `,
+        `${new Date(l.createdAt).toLocaleString().slice(0, 17)} | ${l.changedBy.name} | ${l.fieldName}: ${l.oldValue} → ${l.newValue}`,
+        "gray"
+      );
+    });
+
+    // 重跑规则，验证 ruleSnapshot 被保存
+    const rerunRespV2 = await request(`/reports/${verifyDemoReportId}/rule-checks/rerun`, {
+      method: "POST",
+      token: qcManagerLogin.token,
+    });
+    log(
+      "",
+      `重跑规则, total=${rerunRespV2.total}, TOOTH_POSITION_FORMAT 已关闭规则理应不命中`,
+      "cyan"
+    );
+
+    // 恢复规则
+    await request(`/rule-configs/${toothRule.id}`, {
+      method: "PUT",
+      body: { enabled: true, severity: "ERROR" },
+      token: qcManagerLogin.token,
+    });
+    log("  V ", `恢复规则: enabled=true, severity=ERROR`, "green");
 
     log("\n=== 端到端流程演示完成！ ===", null, "magenta");
   } catch (err) {

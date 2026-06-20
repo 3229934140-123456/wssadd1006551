@@ -394,7 +394,8 @@ router.post('/feedbacks/:feedbackId/verify', requireRole(UserRole.ADMIN, UserRol
       return res.json({ success: true, action: 'REJECTED', feedback: fb.id, message: '已退回，医生需继续整改' })
     }
 
-    // 全部 APPROVED 后判断：是否该报告所有有 fieldName 的反馈都被确认通过或自动整改？
+    // 全部 APPROVED 后判断：是否该报告所有有 fieldName 的反馈都被审核员确认通过？
+    // 未确认 = isResolved=false（没整改或被退回） OR 已整改但审核员还没处理（resolvedBy=DOCTOR）
     const remainingFieldFeedbacks = await prisma.auditFeedback.count({
       where: {
         reportId: fb.reportId,
@@ -404,7 +405,8 @@ router.post('/feedbacks/:feedbackId/verify', requireRole(UserRole.ADMIN, UserRol
           {
             AND: [
               { isResolved: true },
-              { resolvedAction: 'REJECTED' },
+              { resolvedBy: { not: 'AUDITOR' } },
+              { resolvedAction: { not: 'APPROVED' } },
             ],
           },
         ],

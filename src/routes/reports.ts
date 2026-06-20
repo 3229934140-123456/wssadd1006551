@@ -10,6 +10,177 @@ const router = Router()
 
 router.use(authenticate)
 
+router.get('/workbench', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER, UserRole.QC_AUDITOR), async (req: AuthRequest, res: Response) => {
+  try {
+    const {
+      status, // NEEDS_REVISION | PENDING_VERIFICATION | RECTIFIED | REJECTED
+      clinicId,
+      submitterId,
+      reportType,
+      issueCategory,
+      page = '1',
+      pageSize = '20',
+    } = req.query
+
+    // 构造基础查询条件
+    const baseWhere: any = {}
+    if (clinicId) baseWhere.clinicId = clinicId as string
+    if (submitterId) baseWhere.submitterId = submitterId as string
+    if (reportType) baseWhere.type = reportType as string
+
+    // 根据 status 过滤（REJECTED 是虚拟状态：有 resolvedAction='REJECTED' 的反馈）
+    let statusWhere: any = {}
+    if (status === 'REJECTED') {
+      // 已退回：有被审核员退回的反馈
+      baseWhere.OR = [
+        { status: ReportStatus.NEEDS_REVISION },
+        { status: ReportStatus.PENDING_VERIFICATION },
+      ]
+    } else if (status) {
+      baseWhere.status = status as string
+    }
+
+    const pageNum = Math.max(1, parseInt(page as string))
+    const size = Math.min(100, Math.max(1, parseInt(pageSize as string)))
+    const skip = (pageNum - 1) * size
+
+    // 查询报告，包含相关统计信息
+    const reports = await prisma.report.findMany({
+      where: baseWhere,
+      skip,
+      take: size,
+      include: {
+        clinic: { select: { id: true, name: true, code: true } },
+        submitter: { select: { id: true, name: true } },
+        auditTasks: {
+          where: { status: { not: 'COMPLETED' } },
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          include: { assignedTo: { select: { id: true, name: true } } },
+        },
+        auditFeedbacks: {
+          orderBy: { createdAt: 'desc' },
+        },
+        ruleChecks: {
+          where: { severity: RuleSeverity.ERROR, passed: false },
+          take: 3,
+        },
+      },
+      orderBy: [{ updatedAt: 'desc' }, { createdAt: 'desc' }],
+    })
+
+    // 如果指定了 issueCategory，进一步过滤
+    let filteredReports = reports
+    if (issueCategory) {
+      filteredReports = reports.filter(r =>
+        r.auditFeedbacks.some(fb => fb.issueCategory === issueCategory)
+      )
+    }
+    // 如果是 REJECTED 状态，过滤出有被退回反馈的报告
+    if (status === 'REJECTED') {
+      filteredReports = filteredReports.filter(r =>
+        r.auditFeedbacks.some(fb => fb.resolvedAction === 'REJECTED')
+      )
+    }
+
+    // 计算总数（使用相同过滤逻辑）
+    const totalQuery: any = { ...baseWhere }
+    let total = await prisma.report.count({ where: totalQuery })
+    if (issueCategory || status === 'REJECTED') {
+      // 复杂过滤，用全量数据估算（或单独查询）
+      const allIds = await prisma.report.findMany({
+        where: baseWhere,
+        select: { id: true, auditFeedbacks: true },
+      })
+      total = allIds.filter(r => {
+        if (issueCategory && !r.auditFeedbacks.some(fb => fb.issueCategory === issueCategory)) return false
+        if (status === 'REJECTED' && !r.auditFeedbacks.some(fb => fb.resolvedAction === 'REJECTED')) return false
+        return true
+      }).length
+    }
+
+    // 组装每条报告的汇总信息
+    const list = filteredReports.map(r => {
+      const fieldFeedbacks = r.auditFeedbacks.filter(fb => fb.fieldName != null)
+      const totalField = fieldFeedbacks.length
+      // 待确认数 = 未整改 或 已整改但审核员还没确认通过
+      const pendingCount = fieldFeedbacks.filter(fb =>
+        !fb.isResolved ||
+        (fb.isResolved && fb.resolvedBy !== 'AUDITOR')
+      ).length
+      // 已退回数
+      const rejectedCount = fieldFeedbacks.filter(fb => fb.resolvedAction === 'REJECTED').length
+      // 最近整改时间
+      const lastResolvedAt = fieldFeedbacks
+        .filter(fb => fb.resolvedAt)
+        .sort((a, b) => (b.resolvedAt?.getTime() || 0) - (a.resolvedAt?.getTime() || 0))[0]?.resolvedAt
+
+      return {
+        id: r.id,
+        reportNo: r.reportNo,
+        type: r.type,
+        patientName: r.patientName,
+        patientId: r.patientId,
+        status: r.status,
+        clinic: r.clinic,
+        submitter: r.submitter,
+        task: r.auditTasks[0] || null,
+        ruleErrors: r.ruleChecks,
+        lastRevisedAt: lastResolvedAt || r.updatedAt,
+        feedbackStats: {
+          total: totalField,
+          pendingVerification: pendingCount,
+          rejected: rejectedCount,
+          verifiedApproved: totalField - pendingCount - rejectedCount,
+        },
+        hasRejected: rejectedCount > 0,
+        categories: [...new Set(r.auditFeedbacks.map(fb => fb.issueCategory))],
+        updatedAt: r.updatedAt,
+        createdAt: r.createdAt,
+      }
+    })
+
+    // 状态分类统计
+    const [totalReports, statsByStatus] = await Promise.all([
+      prisma.report.count({
+        where: { status: { in: ['NEEDS_REVISION', 'PENDING_VERIFICATION', 'RECTIFIED', 'REVISED'] } },
+      }),
+      prisma.report.groupBy({
+        by: ['status'],
+        where: { status: { in: ['NEEDS_REVISION', 'PENDING_VERIFICATION', 'RECTIFIED', 'REVISED'] } },
+        _count: { status: true },
+      }),
+    ])
+
+    // 有退回反馈的报告数（独立统计）
+    const rejectedCount = await prisma.auditFeedback.findMany({
+      where: { resolvedAction: 'REJECTED', isResolved: false },
+      select: { reportId: true },
+      distinct: ['reportId'],
+    })
+
+    const statusCounts: Record<string, number> = {}
+    statsByStatus.forEach(s => { statusCounts[s.status] = s._count.status })
+
+    return res.json({
+      total,
+      page: pageNum,
+      pageSize: size,
+      list,
+      overview: {
+        total: totalReports,
+        needsRevision: statusCounts['NEEDS_REVISION'] || 0,
+        pendingVerification: statusCounts['PENDING_VERIFICATION'] || 0,
+        rectified: statusCounts['RECTIFIED'] || 0,
+        rejected: rejectedCount.length,
+      },
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ error: '服务器内部错误' })
+  }
+})
+
 const createReportSchema = z.object({
   type: z.nativeEnum(ReportType),
   examName: z.string().optional(),
@@ -88,8 +259,9 @@ router.post('/', async (req: AuthRequest, res: Response) => {
     })
 
     if (body.submit) {
-      const issues = await runAllRules(report as any, { useConfigs: true })
-      const dbRecords = issuesToDbRecords(report.id, issues)
+      const { issues, configs } = await runAllRules(report as any, { useConfigs: true })
+      const ruleSnapshot = configs ? JSON.stringify(configs) : null
+      const dbRecords = issuesToDbRecords(report.id, issues, { ruleSnapshot })
       await prisma.ruleCheckResult.createMany({ data: dbRecords })
       const hasErrors = issues.some(i => i.severity === RuleSeverity.ERROR && !i.passed)
       const finalStatus = hasErrors ? ReportStatus.RULE_CHECK_FAILED : ReportStatus.RULE_CHECK_PASSED
@@ -144,8 +316,9 @@ router.put('/:id/submit', async (req: AuthRequest, res: Response) => {
       data: { status: ReportStatus.SUBMITTED },
     })
 
-    const issues = await runAllRules(updated as any, { useConfigs: true })
-    const dbRecords = issuesToDbRecords(report.id, issues)
+    const { issues, configs } = await runAllRules(updated as any, { useConfigs: true })
+    const ruleSnapshot = configs ? JSON.stringify(configs) : null
+    const dbRecords = issuesToDbRecords(report.id, issues, { ruleSnapshot })
     await prisma.ruleCheckResult.deleteMany({ where: { reportId: report.id } })
     await prisma.ruleCheckResult.createMany({ data: dbRecords })
 
@@ -255,38 +428,29 @@ router.put('/:id/revise', async (req: AuthRequest, res: Response) => {
 
     const overallFeedbacks = allFeedbacks.filter(f => !f.fieldName && !f.isResolved)
     let finalResolvedCount = resolvedIds.length
+    let newReportStatus = updated.status
 
-    if (report.status === ReportStatus.NEEDS_REVISION && unresolvedFieldFeedbacks === 0 && (resolvedIds.length > 0 || overallFeedbacks.length > 0)) {
-      if (overallFeedbacks.length > 0) {
-        await prisma.auditFeedback.updateMany({
-          where: { id: { in: overallFeedbacks.map(f => f.id) } },
-          data: {
-            isResolved: true,
-            resolvedAt: new Date(),
-            resolvedBy: 'SYSTEM',
-            resolvedAction: 'AUTO',
-            resolvedNote: '具体问题已整改完成，总评自动通过',
-          },
-        })
-        finalResolvedCount += overallFeedbacks.length
-      }
+    if (report.status === ReportStatus.NEEDS_REVISION && (resolvedIds.length > 0 || unresolvedFieldFeedbacks === 0)) {
+      // 医生完成整改 → 进入待审核员确认阶段（PENDING_VERIFICATION）
+      // 不自动通过总评，留到审核员逐条确认通过后再处理
+      newReportStatus = ReportStatus.PENDING_VERIFICATION
       const tasks = await prisma.auditTask.findMany({
-        where: { reportId: report.id, status: { not: 'RECTIFIED' } },
+        where: { reportId: report.id, status: { in: ['IN_PROGRESS', 'PENDING'] } },
       })
       if (tasks.length > 0) {
         await prisma.auditTask.updateMany({
           where: { id: { in: tasks.map(t => t.id) } },
-          data: { status: 'RECTIFIED', rectifiedAt: new Date() },
+          data: { status: 'IN_PROGRESS' },
         })
-        await prisma.report.update({
-          where: { id: report.id },
-          data: { status: ReportStatus.RECTIFIED },
-        })
-        updated.status = ReportStatus.RECTIFIED
       }
+      await prisma.report.update({
+        where: { id: report.id },
+        data: { status: newReportStatus },
+      })
+      updated.status = newReportStatus
     }
 
-    return res.json({ report: updated, resolvedCount: finalResolvedCount })
+    return res.json({ report: updated, resolvedCount: finalResolvedCount, nextStatus: newReportStatus })
   } catch (err) {
     if (err instanceof z.ZodError) {
       return res.status(400).json({ error: '参数验证失败', details: err.errors })
@@ -483,8 +647,9 @@ router.post('/:id/rule-checks/rerun', requireRole(UserRole.QC_MANAGER, UserRole.
     const report = await prisma.report.findUnique({ where: { id: req.params.id } })
     if (!report) return res.status(404).json({ error: '报告不存在' })
 
-    const issues = await runAllRules(report as any, { useConfigs: true })
-    const dbRecords = issuesToDbRecords(report.id, issues)
+    const { issues, configs } = await runAllRules(report as any, { useConfigs: true })
+    const ruleSnapshot = configs ? JSON.stringify(configs) : null
+    const dbRecords = issuesToDbRecords(report.id, issues, { ruleSnapshot })
     await prisma.ruleCheckResult.deleteMany({ where: { reportId: report.id } })
     await prisma.ruleCheckResult.createMany({ data: dbRecords })
 
