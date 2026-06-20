@@ -1,0 +1,151 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Clinic {
+  id            String    @id @default(uuid())
+  name          String
+  code          String    @unique
+  address       String?
+  phone         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  users         User[]
+  reports       Report[]
+  samplingRules SamplingRule[]
+}
+
+model User {
+  id                        String    @id @default(uuid())
+  username                  String    @unique
+  passwordHash              String
+  name                      String
+  role                      String
+  clinicId                  String?
+  email                     String?
+  phone                     String?
+  createdAt                 DateTime  @default(now())
+  updatedAt                 DateTime  @updatedAt
+
+  clinic                    Clinic?   @relation(fields: [clinicId], references: [id])
+  submittedReports          Report[]  @relation("SubmittedReports")
+  assignedTasks             AuditTask[] @relation("AssignedTasks")
+  auditFeedbacks            AuditFeedback[] @relation("AuditFeedbackAuditor")
+  managedAudits             AuditTask[] @relation("ManagedAudits")
+  samplingRulesAsAuditor    SamplingRule[] @relation("SamplingRuleAuditor")
+  samplingRulesAsSubmitter  SamplingRule[] @relation("SamplingRuleSubmitter")
+  samplingRulesAsCreator    SamplingRule[] @relation("SamplingRuleCreator")
+}
+
+model Report {
+  id               String    @id @default(uuid())
+  reportNo         String    @unique
+  type             String
+  examName         String?
+  patientName      String?
+  patientId        String?
+  clinicId         String
+  submitterId      String
+  description      String    @default("")
+  diagnosis        String    @default("")
+  conclusions      String    @default("")
+  recommendations  String    @default("")
+  toothPositions   String    @default("")
+  rawContent       String    @default("")
+  status           String    @default("DRAFT")
+  version          Int       @default(1)
+  parentReportId   String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  clinic           Clinic    @relation(fields: [clinicId], references: [id])
+  submitter        User      @relation("SubmittedReports", fields: [submitterId], references: [id])
+  parentReport     Report?   @relation("ReportVersions", fields: [parentReportId], references: [id])
+  childReports     Report[]  @relation("ReportVersions")
+  ruleChecks       RuleCheckResult[]
+  auditTasks       AuditTask[]
+  auditFeedbacks   AuditFeedback[]
+}
+
+model RuleCheckResult {
+  id          String   @id @default(uuid())
+  reportId    String
+  ruleCode    String
+  ruleName    String
+  severity    String
+  passed      Boolean
+  message     String
+  fieldName   String?
+  suggestion  String?
+  createdAt   DateTime @default(now())
+
+  report      Report   @relation(fields: [reportId], references: [id])
+}
+
+model SamplingRule {
+  id          String   @id @default(uuid())
+  name        String
+  clinicId    String?
+  auditorId   String?
+  reportType  String?
+  submitterId String?
+  samplingRate Float   @default(0.2)
+  priority    Int      @default(0)
+  isActive    Boolean  @default(true)
+  createdById String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  clinic      Clinic?  @relation(fields: [clinicId], references: [id])
+  auditor     User?    @relation("SamplingRuleAuditor", fields: [auditorId], references: [id])
+  submitter   User?    @relation("SamplingRuleSubmitter", fields: [submitterId], references: [id])
+  createdBy   User     @relation("SamplingRuleCreator", fields: [createdById], references: [id])
+}
+
+model AuditTask {
+  id             String    @id @default(uuid())
+  reportId       String
+  taskDate       DateTime
+  status         String    @default("PENDING")
+  assignedToId   String?
+  assignedById   String?
+  assignedAt     DateTime?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  rectifiedAt    DateTime?
+  priority       Int       @default(0)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  report         Report    @relation(fields: [reportId], references: [id])
+  assignedTo     User?     @relation("AssignedTasks", fields: [assignedToId], references: [id])
+  assignedBy     User?     @relation("ManagedAudits", fields: [assignedById], references: [id])
+  feedbacks      AuditFeedback[]
+}
+
+model AuditFeedback {
+  id             String   @id @default(uuid())
+  taskId         String
+  reportId       String
+  auditorId      String
+  issueCategory  String
+  issueLabel     String
+  fieldName      String?
+  oldValue       String?
+  modification   String   @default("")
+  note           String   @default("")
+  isResolved     Boolean  @default(false)
+  resolvedAt     DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  task           AuditTask @relation(fields: [taskId], references: [id])
+  report         Report    @relation(fields: [reportId], references: [id])
+  auditor        User      @relation("AuditFeedbackAuditor", fields: [auditorId], references: [id])
+}
