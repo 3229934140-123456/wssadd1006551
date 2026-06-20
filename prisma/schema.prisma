@@ -44,6 +44,7 @@ model User {
   ruleConfigsAsCreator      RuleConfig[] @relation("RuleConfigCreator")
   samplingRunsAsTrigger     SamplingRun[] @relation("SamplingRunTrigger")
   ruleConfigChangesAsChanger RuleConfigChangeLog[] @relation("RuleConfigChangeLogChanger")
+  ruleRerunBatchesAsTrigger  RuleRerunBatch[]       @relation("RuleRerunBatchTrigger")
 }
 
 model Report {
@@ -87,9 +88,13 @@ model RuleCheckResult {
   fieldName   String?
   suggestion  String?
   ruleSnapshot String?
+  batchId     String?
   createdAt   DateTime @default(now())
 
-  report      Report   @relation(fields: [reportId], references: [id])
+  report      Report        @relation(fields: [reportId], references: [id])
+  batch       RuleRerunBatch? @relation(fields: [batchId], references: [id])
+
+  @@index([batchId])
 }
 
 model SamplingRule {
@@ -123,9 +128,10 @@ model AuditTask {
   startedAt      DateTime?
   completedAt    DateTime?
   rectifiedAt    DateTime?
+  lastRemindedAt DateTime?
   priority       Int       @default(0)
   createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  updatedAt      DateTime  @default(now())
 
   report         Report    @relation(fields: [reportId], references: [id])
   assignedTo     User?     @relation("AssignedTasks", fields: [assignedToId], references: [id])
@@ -230,4 +236,25 @@ model SamplingRunItem {
   run             SamplingRun @relation(fields: [runId], references: [id])
 
   @@index([runId, selected], name: "SamplingRunItemRunIdSelectedIdx")
+}
+
+model RuleRerunBatch {
+  id              String   @id @default(uuid())
+  batchNo         String   @unique
+  triggeredById   String
+  triggerType     String   @default("MANUAL")   // MANUAL | SCHEDULED | POST_CONFIG_CHANGE
+  ruleSnapshot    String?                      // 运行时的规则配置 JSON
+  reportIds       String?                      // 影响的报告 ID 列表 JSON
+  affectedCount   Int      @default(0)         // 实际影响报告数
+  newIssueCount   Int      @default(0)         // 新增问题数（相比上次检查）
+  removedCount    Int      @default(0)         // 消失问题数
+  changedCount    Int      @default(0)         // 有变化的报告数
+  note            String?
+  createdAt       DateTime @default(now())
+
+  triggeredBy     User              @relation("RuleRerunBatchTrigger", fields: [triggeredById], references: [id])
+  ruleChecks      RuleCheckResult[]
+
+  @@index([triggeredById])
+  @@index([createdAt])
 }

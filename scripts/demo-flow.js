@@ -682,6 +682,208 @@ async function main() {
     });
     log("  V ", `恢复规则: enabled=true, severity=ERROR`, "green");
 
+    // 20. 工作台增强: 排序 + nextHandler + 已退回稳定入口 + issueCategory 筛选分页
+    log("\n=== 20. 工作台 v4: 队列视图排序 / nextHandler / 稳定入口 / 分页筛选 ===", null, "green");
+
+    // 20a. 各种排序
+    const sortCases = [
+      { by: "overdueDays", order: "desc", label: "超期天数(降序)" },
+      { by: "lastRevisedAt", order: "asc", label: "最近整改时间(升序)" },
+      { by: "assignedTo", order: "asc", label: "负责人(升序)" },
+      { by: "reportNo", order: "desc", label: "报告编号(降序)" },
+    ];
+    for (const sc of sortCases) {
+      const res = await request(`/reports/workbench?status=ALL_ACTIVE&pageSize=3&sortBy=${sc.by}&sortOrder=${sc.order}`, {
+        token: qcManagerLogin.token,
+      });
+      const top = res.list[0] || {};
+      const nh = top.nextHandler || {};
+      log(
+        "",
+        `${sc.label} | top1=${top.reportNo || "-"} | nextHandler=${nh.type || "-"}${nh.userName ? "(" + nh.userName + ")" : ""} | overdue=${top.overdueDays || 0}d`,
+        "cyan"
+      );
+    }
+
+    // 20b. 已退回稳定入口 (REJECTED)
+    // 先制造一份 NEEDS_REVISION + REJECTED 反馈的报告
+    const rejectedDemo = await request("/reports", {
+      method: "POST",
+      body: {
+        type: "CBCT",
+        examName: "CBCT",
+        patientName: "退回稳定入口测试",
+        patientId: "REJECTED-STABLE-001",
+        diagnosis: "有炎症",
+        description: "疼痛",
+        recommendations: "建议治疗",
+        conclusions: "异常",
+        toothPositions: "",
+        submit: true,
+      },
+      token: doctorLogin.token,
+    });
+    const rejReportId = rejectedDemo.report.id;
+    let rejTaskId;
+    try {
+      const t = await request("/audit-tasks/manual", {
+        method: "POST",
+        body: { reportId: rejReportId, assignedToId: qcAuditorLogin.user.id },
+        token: qcManagerLogin.token,
+      });
+      rejTaskId = t.id;
+    } catch (e) {
+      const tasks = await request(`/audit-tasks?pageSize=20&reportId=${rejReportId}`, { token: qcManagerLogin.token });
+      rejTaskId = tasks.list[0].id;
+      if (!tasks.list[0].assignedToId) {
+        await request(`/audit-tasks/${rejTaskId}/assign`, {
+          method: "POST", body: { assignedToId: qcAuditorLogin.user.id },
+          token: qcManagerLogin.token,
+        });
+      }
+    }
+    await request(`/audit-tasks/${rejTaskId}/start`, { method: "POST", token: qcAuditorLogin.token });
+    await request(`/audit-tasks/${rejTaskId}/feedback`, {
+      method: "POST",
+      body: { issueLabel: "缺牙位", issueCategory: "DIAGNOSIS_INCOMPLETE", note: "缺牙位", fieldName: "diagnosis", oldValue: "有炎症", modification: "36炎症" },
+      token: qcAuditorLogin.token,
+    });
+    await request(`/audit-tasks/${rejTaskId}/complete`, {
+      method: "POST", body: { action: "REJECT", overallNote: "打回" },
+      token: qcAuditorLogin.token,
+    });
+    // 医生先整改 -> PENDING_VERIFICATION -> 审核员退回 -> NEEDS_REVISION 稳定
+    await request(`/reports/${rejReportId}/revise`, {
+      method: "PUT", body: { diagnosis: "36炎症" },
+      token: doctorLogin.token,
+    });
+    const rejFbs = await request(`/reports/${rejReportId}/feedbacks`, { token: qcAuditorLogin.token });
+    const fieldFb = rejFbs.find((f) => f.fieldName != null && f.isResolved);
+    if (fieldFb) {
+      await request(`/audit-tasks/feedbacks/${fieldFb.id}/verify`, {
+        method: "POST", body: { action: "REJECTED", note: "还是不对" },
+        token: qcAuditorLogin.token,
+      });
+    }
+    const rejectedWB = await request("/reports/workbench?status=REJECTED&pageSize=5", { token: qcManagerLogin.token });
+    log(
+      "",
+      `已退回稳定入口: list.length=${rejectedWB.list.length}, overview.rejected=${rejectedWB.overview.rejected}, status 过滤正确性=${rejectedWB.list.every((r) => r.status === "NEEDS_REVISION")}`,
+      rejectedWB.overview.rejected > 0 && rejectedWB.list.length >= 1 ? "green" : "yellow"
+    );
+
+    // 20c. issueCategory 筛选分页: 总数 == list.length(第一页) == 实际带该类别的数量
+    const cat = "DIAGNOSIS_INCOMPLETE";
+    const wbCat = await request(`/reports/workbench?issueCategory=${cat}&pageSize=5`, { token: qcManagerLogin.token });
+    const listMatchesCat = wbCat.list.every((r) => (r.categories || []).includes(cat));
+    log(
+      "",
+      `类别筛选: ${cat} | total=${wbCat.total}, page1.len=${wbCat.list.length}, 结果类别全部匹配=${listMatchesCat}`,
+      wbCat.total > 0 && listMatchesCat ? "green" : "yellow"
+    );
+
+    // 20d. 批量分配复核人 + 批量提醒
+    log("\n=== 20d. 批量分配 + 批量提醒 ===", null, "green");
+    const activeIds = wbCat.list.slice(0, 3).map((r) => r.id);
+    if (activeIds.length > 0) {
+      const assignResp = await request("/reports/workbench/batch-assign", {
+        method: "POST",
+        body: { reportIds: activeIds, assignedToId: qcAuditorLogin.user.id },
+        token: qcManagerLogin.token,
+      });
+      log(
+        "",
+        `批量分配 ${activeIds.length} 份: assigned=${assignResp.assigned}, updated=${assignResp.updatedTasks}, created=${assignResp.createdTasks}, skipped=${assignResp.skipped}, 分配给=${assignResp.assignedTo.name}`,
+        assignResp.assigned > 0 ? "green" : "yellow"
+      );
+      const remindResp = await request("/reports/workbench/batch-remind", {
+        method: "POST",
+        body: { reportIds: activeIds, targetRole: "AUTO", note: "请尽快处理" },
+        token: qcManagerLogin.token,
+      });
+      log(
+        "",
+        `批量提醒 AUTO: 医生=${remindResp.doctorReminded}, 审核员=${remindResp.auditorReminded}, skipped=${remindResp.skipped}, 最近提醒=${new Date(remindResp.lastRemindedAt).toLocaleTimeString().slice(0, 5)}`,
+        remindResp.doctorReminded + remindResp.auditorReminded > 0 ? "green" : "yellow"
+      );
+    }
+
+    // 21. 规则追溯批次化: 单报告重跑批次 + 批量重跑批次 + 批次详情(规则快照/差异对比)
+    log("\n=== 21. 规则追溯批次化: 单报告批次 / 批量批次 / 差异对比 ===", null, "green");
+
+    // 先改一条规则，再对多份报告重跑，观察差异
+    const diagnoRuleV2 = rcList.list.find(
+      (c) => c.ruleCode === "DIAGNOSIS_WITH_TOOTH" && c.reportType === "PANORAMIC_XRAY"
+    );
+    if (diagnoRuleV2) {
+      await request(`/rule-configs/${diagnoRuleV2.id}`, {
+        method: "PUT", body: { enabled: true, severity: "ERROR" },
+        token: qcManagerLogin.token,
+      });
+      log("  V ", `开启 DIAGNOSIS_WITH_TOOTH(PAN): severity=ERROR`, "cyan");
+    }
+    const singleRerun = await request(`/reports/${rejReportId}/rule-checks/rerun`, {
+      method: "POST", body: { note: "v4-单报告批次测试" },
+      token: qcManagerLogin.token,
+    });
+    log(
+      "",
+      `单报告批次: batchNo=${singleRerun.batchNo?.slice(0, 14)}..., 新增问题=${singleRerun.diff?.new?.length || 0}, 消失问题=${singleRerun.diff?.removed?.length || 0}`,
+      singleRerun.batchNo ? "cyan" : "red"
+    );
+
+    // 批量重跑: 针对近 30 天的 PANORAMIC_XRAY 报告
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+    const batchRerun = await request("/reports/rule-checks/batch-rerun", {
+      method: "POST",
+      body: {
+        reportType: "PANORAMIC_XRAY",
+        fromDate: thirtyDaysAgo,
+        note: "v4-批量批次: PAN近30天",
+        maxCount: 5,
+      },
+      token: qcManagerLogin.token,
+    });
+    log(
+      "",
+      `批量批次: batchNo=${batchRerun.batchNo?.slice(0, 14)}..., total=${batchRerun.total}, changed=${batchRerun.changedCount}, newIssues=${batchRerun.newIssueCount}, removed=${batchRerun.removedCount}`,
+      batchRerun.batchId ? "cyan" : "red"
+    );
+
+    // 批次列表查询
+    const bl = await request("/reports/rule-checks/batches?pageSize=5", { token: qcManagerLogin.token });
+    log(
+      "",
+      `批次列表: 共 ${bl.total} 个批次, 最近 2 个:`,
+      bl.total > 0 ? "cyan" : "red"
+    );
+    bl.list.slice(0, 2).forEach((b) => {
+      log(
+        "  - ",
+        `${b.batchNo.slice(0, 14)}... | ${new Date(b.createdAt).toLocaleString().slice(0, 10)} | ${b.triggeredBy?.name} | affected=${b.affectedCount}, changed=${b.changedCount}, newIssues=${b.newIssueCount}, removed=${b.removedCount}`,
+        "gray"
+      );
+    });
+
+    // 批次详情: 看规则快照 + 影响的报告
+    if (batchRerun.batchId) {
+      const bd = await request(`/reports/rule-checks/batches/${batchRerun.batchId}`, { token: qcManagerLogin.token });
+      log(
+        "",
+        `批次详情: 规则快照 ${bd.batch.ruleSnapshot ? "已保存 (" + bd.batch.ruleSnapshot.length + " 条配置)" : "无"}, 影响 ${bd.reportCount} 份, 本次规则检查生成了 ${bd.reports.reduce((s, r) => s + r.ruleChecks.length, 0)} 条记录`,
+        bd.batch.ruleSnapshot ? "green" : "yellow"
+      );
+    }
+
+    // 恢复 diagnoRule
+    if (diagnoRuleV2) {
+      await request(`/rule-configs/${diagnoRuleV2.id}`, {
+        method: "PUT", body: { enabled: false, severity: "WARNING" },
+        token: qcManagerLogin.token,
+      });
+      log("  V ", `恢复 DIAGNOSIS_WITH_TOOTH(PAN): enabled=false`, "green");
+    }
+
     log("\n=== 端到端流程演示完成！ ===", null, "magenta");
   } catch (err) {
     console.error("\n错误:", err.message);

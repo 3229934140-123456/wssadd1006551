@@ -21,6 +21,7 @@ export type RuleCheckResultShape = {
   fieldName?: string | null
   suggestion?: string | null
   ruleSnapshot?: string | null
+  batchId?: string | null
 }
 
 export interface RuleCheckIssue {
@@ -341,9 +342,10 @@ export async function runAllRules(
 export function issuesToDbRecords(
   reportId: string,
   issues: RuleCheckIssue[],
-  opts?: { ruleSnapshot?: string | null },
+  opts?: { ruleSnapshot?: string | null; batchId?: string | null },
 ): RuleCheckResultShape[] {
   const ruleSnapshot = opts?.ruleSnapshot ?? null
+  const batchId = opts?.batchId ?? null
   return issues.map(issue => ({
     reportId,
     ruleCode: issue.ruleCode,
@@ -354,5 +356,6 @@ export function issuesToDbRecords(
     fieldName: issue.fieldName,
     suggestion: issue.suggestion,
     ruleSnapshot,
+    batchId,
   }))
 }
