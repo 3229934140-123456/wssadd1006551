@@ -334,6 +334,125 @@ router.delete('/feedbacks/:feedbackId', requireRole(UserRole.ADMIN, UserRole.QC_
   }
 })
 
+const verifyFeedbackSchema = z.object({
+  action: z.enum(['APPROVED', 'REJECTED']),
+  note: z.string().max(500).optional(),
+})
+
+router.post('/feedbacks/:feedbackId/verify', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER, UserRole.QC_AUDITOR), async (req: AuthRequest, res: Response) => {
+  try {
+    const body = verifyFeedbackSchema.parse(req.body)
+    const fb = await prisma.auditFeedback.findUnique({
+      where: { id: req.params.feedbackId },
+      include: { task: true, report: true },
+    })
+    if (!fb) return res.status(404).json({ error: '反馈不存在' })
+
+    if (!fb.isResolved || fb.resolvedBy === 'AUDITOR') {
+      // 医生还没整改或已被审核员处理过，只有医生/系统整改的才可以审核
+    }
+    if (!fb.newValue && body.action === 'APPROVED') {
+      return res.status(400).json({ error: '该反馈医生尚未整改，无法审核通过' })
+    }
+
+    const updated = await prisma.auditFeedback.update({
+      where: { id: fb.id },
+      data: {
+        isResolved: true,
+        resolvedBy: 'AUDITOR',
+        resolvedAction: body.action,
+        resolvedNote: body.note || undefined,
+        resolvedAt: new Date(),
+      },
+    })
+
+    // 如果 REJECTED：退回继续改 - 将报告状态恢复为 NEEDS_REVISION，任务恢复为 IN_PROGRESS
+    // 同时把该条反馈重置，让医生重新修改
+    if (body.action === 'REJECTED') {
+      await prisma.$transaction([
+        prisma.report.update({
+          where: { id: fb.reportId },
+          data: { status: 'NEEDS_REVISION' },
+        }),
+        prisma.auditTask.update({
+          where: { id: fb.taskId },
+          data: { status: 'IN_PROGRESS' },
+        }),
+        // 重置反馈为未解决，医生可以再次编辑
+        prisma.auditFeedback.update({
+          where: { id: fb.id },
+          data: {
+            isResolved: false,
+            resolvedBy: null,
+            resolvedAction: null,
+            resolvedAt: null,
+            oldValue: fb.newValue, // 之前修改后的值作为新的 oldValue，医生继续在这个基础上改
+            newValue: null,
+          },
+        }),
+      ])
+      return res.json({ success: true, action: 'REJECTED', feedback: fb.id, message: '已退回，医生需继续整改' })
+    }
+
+    // 全部 APPROVED 后判断：是否该报告所有有 fieldName 的反馈都被确认通过或自动整改？
+    const remainingFieldFeedbacks = await prisma.auditFeedback.count({
+      where: {
+        reportId: fb.reportId,
+        fieldName: { not: null },
+        OR: [
+          { isResolved: false },
+          {
+            AND: [
+              { isResolved: true },
+              { resolvedAction: 'REJECTED' },
+            ],
+          },
+        ],
+      },
+    })
+
+    if (remainingFieldFeedbacks === 0) {
+      // 自动把总评类反馈也通过 + 报告和任务推到 RECTIFIED
+      const [reportUpdated, taskUpdated, autoOverallCount] = await prisma.$transaction([
+        prisma.auditFeedback.updateMany({
+          where: { reportId: fb.reportId, fieldName: null, isResolved: false },
+          data: {
+            isResolved: true,
+            resolvedBy: 'SYSTEM',
+            resolvedAction: 'AUTO',
+            resolvedNote: '具体问题已确认通过，总评自动通过',
+            resolvedAt: new Date(),
+          },
+        }),
+        prisma.report.update({
+          where: { id: fb.reportId },
+          data: { status: 'RECTIFIED' },
+        }),
+        prisma.auditTask.update({
+          where: { id: fb.taskId },
+          data: { status: 'COMPLETED', completedAt: new Date() },
+        }),
+      ] as any)
+
+      return res.json({
+        success: true,
+        action: 'APPROVED',
+        feedback: updated.id,
+        reportStatus: 'RECTIFIED',
+        autoApprovedOverall: (autoOverallCount as any)?.count ?? 0,
+      })
+    }
+
+    return res.json({ success: true, action: 'APPROVED', feedback: updated.id, remainingUnverified: remainingFieldFeedbacks })
+  } catch (err) {
+    if (err instanceof z.ZodError) {
+      return res.status(400).json({ error: '参数验证失败', details: err.errors })
+    }
+    console.error(err)
+    return res.status(500).json({ error: '服务器内部错误' })
+  }
+})
+
 const completeSchema = z.object({
   action: z.enum(['APPROVE', 'REJECT']),
   overallNote: z.string().default(''),
@@ -428,10 +547,18 @@ router.post('/manual', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER), async (
 
 router.post('/generate-daily', requireRole(UserRole.ADMIN, UserRole.QC_MANAGER), async (req: AuthRequest, res: Response) => {
   try {
-    const { date } = req.body as { date?: string }
-    const result = await generateDailyTasks(date ? new Date(date) : undefined)
+    const { date, regenerateExisting, note } = req.body as { date?: string; regenerateExisting?: boolean; note?: string }
+    const result = await generateDailyTasks(date ? new Date(date) : undefined, {
+      triggeredById: req.user!.userId,
+      triggerType: 'MANUAL' as any,
+      regenerateExisting,
+      note,
+    })
     return res.json(result)
   } catch (err) {
+    if (err instanceof Error) {
+      return res.status(400).json({ error: err.message })
+    }
     console.error(err)
     return res.status(500).json({ error: '服务器内部错误' })
   }

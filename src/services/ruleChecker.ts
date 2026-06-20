@@ -1,4 +1,5 @@
-import { RuleSeverity } from '../lib/enums'
+import { RuleSeverity, RuleCode, RuleDefinitions, ReportType } from '../lib/enums'
+import prisma from '../lib/prisma'
 
 export type ReportShape = {
   id: string
@@ -31,6 +32,14 @@ export interface RuleCheckIssue {
   suggestion?: string
 }
 
+export type EffectiveRuleConfig = {
+  ruleCode: RuleCode
+  ruleName: string
+  enabled: boolean
+  severity: RuleSeverity
+  reportType?: string | null
+}
+
 const STANDARD_TOOTH_PATTERN = /^[1-4][1-8](,[1-4][1-8])*$/
 const TOOTH_MENTION_PATTERN = /([1-4][1-8]|乳牙|全口|上颌|下颌|前牙|后牙|磨牙|尖牙|切牙)/g
 
@@ -59,9 +68,9 @@ const STANDARD_TERMINOLOGY_MAP: Record<string, string> = {
 function checkExamName(report: ReportShape): RuleCheckIssue {
   const passed = !!report.examName && report.examName.trim().length > 0
   return {
-    ruleCode: 'EXAM_NAME_001',
-    ruleName: '检查名称必填',
-    severity: RuleSeverity.ERROR,
+    ruleCode: RuleCode.EXAM_NAME_REQUIRED,
+    ruleName: RuleDefinitions[RuleCode.EXAM_NAME_REQUIRED].name,
+    severity: RuleDefinitions[RuleCode.EXAM_NAME_REQUIRED].defaultSeverity,
     passed,
     message: passed ? '检查名称已填写' : '检查名称缺失，请填写规范的检查名称',
     fieldName: 'examName',
@@ -72,9 +81,9 @@ function checkExamName(report: ReportShape): RuleCheckIssue {
 function checkExamNameStandard(report: ReportShape): RuleCheckIssue {
   if (!report.examName) {
     return {
-      ruleCode: 'EXAM_NAME_002',
-      ruleName: '检查名称规范性',
-      severity: RuleSeverity.WARNING,
+      ruleCode: RuleCode.EXAM_NAME_STANDARD,
+      ruleName: RuleDefinitions[RuleCode.EXAM_NAME_STANDARD].name,
+      severity: RuleDefinitions[RuleCode.EXAM_NAME_STANDARD].defaultSeverity,
       passed: false,
       message: '检查名称缺失，无法验证规范性',
       fieldName: 'examName',
@@ -83,9 +92,9 @@ function checkExamNameStandard(report: ReportShape): RuleCheckIssue {
   const validNames = STANDARD_EXAM_NAMES[report.type] || []
   const passed = validNames.some(n => report.examName!.includes(n))
   return {
-    ruleCode: 'EXAM_NAME_002',
-    ruleName: '检查名称规范性',
-    severity: RuleSeverity.WARNING,
+    ruleCode: RuleCode.EXAM_NAME_STANDARD,
+    ruleName: RuleDefinitions[RuleCode.EXAM_NAME_STANDARD].name,
+    severity: RuleDefinitions[RuleCode.EXAM_NAME_STANDARD].defaultSeverity,
     passed,
     message: passed ? '检查名称符合规范' : `检查名称可能不规范，建议使用：${validNames.join('、')}`,
     fieldName: 'examName',
@@ -94,12 +103,13 @@ function checkExamNameStandard(report: ReportShape): RuleCheckIssue {
 }
 
 function checkToothPositionFormat(report: ReportShape): RuleCheckIssue {
+  const defaultSev = RuleDefinitions[RuleCode.TOOTH_POSITION_FORMAT].defaultSeverity
   const content = (report.toothPositions + report.diagnosis + report.conclusions + report.recommendations).trim()
   if (!content) {
     return {
-      ruleCode: 'TOOTH_001',
-      ruleName: '牙位信息存在性',
-      severity: RuleSeverity.ERROR,
+      ruleCode: RuleCode.TOOTH_POSITION_FORMAT,
+      ruleName: RuleDefinitions[RuleCode.TOOTH_POSITION_FORMAT].name,
+      severity: defaultSev,
       passed: false,
       message: '未发现任何牙位相关描述，请补充涉及的牙位',
       fieldName: 'toothPositions',
@@ -110,19 +120,19 @@ function checkToothPositionFormat(report: ReportShape): RuleCheckIssue {
     const positions = report.toothPositions.split(/[,，、;；\s]+/).filter(Boolean)
     const allValid = positions.every(p => STANDARD_TOOTH_PATTERN.test(p) || /乳牙|全口|上颌|下颌|前牙|后牙/.test(p))
     return {
-      ruleCode: 'TOOTH_001',
-      ruleName: '牙位写法规范',
-      severity: allValid ? RuleSeverity.INFO : RuleSeverity.WARNING,
+      ruleCode: RuleCode.TOOTH_POSITION_FORMAT,
+      ruleName: RuleDefinitions[RuleCode.TOOTH_POSITION_FORMAT].name,
+      severity: allValid ? RuleSeverity.INFO : defaultSev,
       passed: allValid,
       message: allValid ? '牙位写法符合 FDI 规范' : '牙位写法不规范，请使用 FDI 两位数标注法（1-4象限+1-8牙位）',
       fieldName: 'toothPositions',
       suggestion: '标准格式示例：16,25,36,47（逗号分隔，无空格）',
     }
   }
-  const hasToothMention = TOOTH_MENTION_PATTERN.test(content)
+  const hasToothMention = content.search(TOOTH_MENTION_PATTERN) >= 0
   return {
-    ruleCode: 'TOOTH_001',
-    ruleName: '牙位信息完整性',
+    ruleCode: RuleCode.TOOTH_POSITION_FORMAT,
+    ruleName: RuleDefinitions[RuleCode.TOOTH_POSITION_FORMAT].name,
     severity: RuleSeverity.WARNING,
     passed: hasToothMention,
     message: hasToothMention ? '文本中包含牙位相关描述' : '牙位字段为空且内容中未提及具体牙位',
@@ -132,12 +142,13 @@ function checkToothPositionFormat(report: ReportShape): RuleCheckIssue {
 }
 
 function checkDiagnosisWithTooth(report: ReportShape): RuleCheckIssue {
+  const defaultSev = RuleDefinitions[RuleCode.DIAGNOSIS_WITH_TOOTH].defaultSeverity
   const diagnosis = report.diagnosis
   if (!diagnosis.trim()) {
     return {
-      ruleCode: 'DIAG_001',
-      ruleName: '诊断内容必填',
-      severity: RuleSeverity.ERROR,
+      ruleCode: RuleCode.DIAGNOSIS_WITH_TOOTH,
+      ruleName: RuleDefinitions[RuleCode.DIAGNOSIS_WITH_TOOTH].name,
+      severity: defaultSev,
       passed: false,
       message: '诊断结论缺失，请填写诊断内容',
       fieldName: 'diagnosis',
@@ -146,19 +157,19 @@ function checkDiagnosisWithTooth(report: ReportShape): RuleCheckIssue {
   const hasVagueTerm = VAGUE_DIAGNOSIS_WORDS.some(w => diagnosis.includes(w))
   if (!hasVagueTerm) {
     return {
-      ruleCode: 'DIAG_002',
-      ruleName: '诊断-牙位关联检查',
+      ruleCode: RuleCode.DIAGNOSIS_WITH_TOOTH,
+      ruleName: RuleDefinitions[RuleCode.DIAGNOSIS_WITH_TOOTH].name,
       severity: RuleSeverity.INFO,
       passed: true,
       message: '诊断描述中未检测到模糊术语',
       fieldName: 'diagnosis',
     }
   }
-  const hasToothInDiagnosis = TOOTH_MENTION_PATTERN.test(diagnosis) || report.toothPositions.trim().length > 0
+  const hasToothInDiagnosis = diagnosis.search(TOOTH_MENTION_PATTERN) >= 0 || report.toothPositions.trim().length > 0
   return {
-    ruleCode: 'DIAG_002',
-    ruleName: '诊断需明确牙位',
-    severity: RuleSeverity.ERROR,
+    ruleCode: RuleCode.DIAGNOSIS_WITH_TOOTH,
+    ruleName: RuleDefinitions[RuleCode.DIAGNOSIS_WITH_TOOTH].name,
+    severity: defaultSev,
     passed: hasToothInDiagnosis,
     message: hasToothInDiagnosis
       ? '模糊术语已关联到具体牙位'
@@ -169,12 +180,13 @@ function checkDiagnosisWithTooth(report: ReportShape): RuleCheckIssue {
 }
 
 function checkConclusion(report: ReportShape): RuleCheckIssue {
+  const defaultSev = RuleDefinitions[RuleCode.CONCLUSION_COMPLETENESS].defaultSeverity
   const conclusions = report.conclusions
   if (!conclusions.trim()) {
     return {
-      ruleCode: 'CONCL_001',
-      ruleName: '结论必填',
-      severity: RuleSeverity.ERROR,
+      ruleCode: RuleCode.CONCLUSION_COMPLETENESS,
+      ruleName: RuleDefinitions[RuleCode.CONCLUSION_COMPLETENESS].name,
+      severity: defaultSev,
       passed: false,
       message: '诊断结论缺失，请填写总结性结论',
       fieldName: 'conclusions',
@@ -182,9 +194,9 @@ function checkConclusion(report: ReportShape): RuleCheckIssue {
   }
   const isTooVague = VAGUE_CONCLUSION_WORDS.some(w => conclusions.trim() === w || conclusions.trim().length < 6)
   return {
-    ruleCode: 'CONCL_002',
-    ruleName: '结论完整性',
-    severity: RuleSeverity.WARNING,
+    ruleCode: RuleCode.CONCLUSION_COMPLETENESS,
+    ruleName: RuleDefinitions[RuleCode.CONCLUSION_COMPLETENESS].name,
+    severity: defaultSev,
     passed: !isTooVague,
     message: isTooVague ? '结论过于笼统，请补充具体诊断结论' : '结论填写完整',
     fieldName: 'conclusions',
@@ -193,12 +205,13 @@ function checkConclusion(report: ReportShape): RuleCheckIssue {
 }
 
 function checkRecommendations(report: ReportShape): RuleCheckIssue {
+  const defaultSev = RuleDefinitions[RuleCode.RECOMMENDATION_RELEVANCE].defaultSeverity
   const recommendations = report.recommendations
   if (!recommendations.trim()) {
     return {
-      ruleCode: 'REC_001',
-      ruleName: '建议必填',
-      severity: RuleSeverity.ERROR,
+      ruleCode: RuleCode.RECOMMENDATION_RELEVANCE,
+      ruleName: RuleDefinitions[RuleCode.RECOMMENDATION_RELEVANCE].name,
+      severity: defaultSev,
       passed: false,
       message: '治疗建议缺失，请填写处置建议',
       fieldName: 'recommendations',
@@ -208,9 +221,9 @@ function checkRecommendations(report: ReportShape): RuleCheckIssue {
   if (hasImageRelated) {
     const recMatchesImage = /根管|充填|拔除|修复|种植|洁治|刮治|观察|复查/.test(recommendations)
     return {
-      ruleCode: 'REC_002',
-      ruleName: '建议与影像匹配性',
-      severity: RuleSeverity.WARNING,
+      ruleCode: RuleCode.RECOMMENDATION_RELEVANCE,
+      ruleName: RuleDefinitions[RuleCode.RECOMMENDATION_RELEVANCE].name,
+      severity: defaultSev,
       passed: recMatchesImage,
       message: recMatchesImage
         ? '建议内容与常规影像检查处置方向一致'
@@ -220,8 +233,8 @@ function checkRecommendations(report: ReportShape): RuleCheckIssue {
     }
   }
   return {
-    ruleCode: 'REC_002',
-    ruleName: '建议与影像匹配性',
+    ruleCode: RuleCode.RECOMMENDATION_RELEVANCE,
+    ruleName: RuleDefinitions[RuleCode.RECOMMENDATION_RELEVANCE].name,
     severity: RuleSeverity.INFO,
     passed: true,
     message: '建议已填写',
@@ -230,6 +243,7 @@ function checkRecommendations(report: ReportShape): RuleCheckIssue {
 }
 
 function checkTerminologyConsistency(report: ReportShape): RuleCheckIssue {
+  const defaultSev = RuleDefinitions[RuleCode.TERMINOLOGY_CONSISTENCY].defaultSeverity
   const allText = `${report.diagnosis} ${report.conclusions} ${report.recommendations} ${report.description}`
   const usedTerms: string[] = []
   for (const [colloquial, standard] of Object.entries(STANDARD_TERMINOLOGY_MAP)) {
@@ -238,9 +252,9 @@ function checkTerminologyConsistency(report: ReportShape): RuleCheckIssue {
     }
   }
   return {
-    ruleCode: 'TERM_001',
-    ruleName: '术语统一性',
-    severity: usedTerms.length > 0 ? RuleSeverity.WARNING : RuleSeverity.INFO,
+    ruleCode: RuleCode.TERMINOLOGY_CONSISTENCY,
+    ruleName: RuleDefinitions[RuleCode.TERMINOLOGY_CONSISTENCY].name,
+    severity: usedTerms.length > 0 ? defaultSev : RuleSeverity.INFO,
     passed: usedTerms.length === 0,
     message: usedTerms.length > 0
       ? `检测到非标准术语，建议替换：${usedTerms.join('；')}`
@@ -250,8 +264,63 @@ function checkTerminologyConsistency(report: ReportShape): RuleCheckIssue {
   }
 }
 
-export function runAllRules(report: ReportShape): RuleCheckIssue[] {
-  return [
+export async function loadEffectiveRuleConfigs(reportType?: string | null): Promise<EffectiveRuleConfig[]> {
+  const dbConfigs = await prisma.ruleConfig.findMany({
+    where: { OR: [{ reportType }, { reportType: null }] },
+  })
+  const result: EffectiveRuleConfig[] = []
+  const processedByType = new Map<string, EffectiveRuleConfig>()
+  for (const rc of dbConfigs) {
+    const key = rc.ruleCode + '|' + (rc.reportType || 'GLOBAL')
+    processedByType.set(key, {
+      ruleCode: rc.ruleCode as RuleCode,
+      ruleName: rc.ruleName,
+      enabled: rc.enabled,
+      severity: rc.severity as RuleSeverity,
+      reportType: rc.reportType,
+    })
+  }
+  for (const code of Object.values(RuleCode) as RuleCode[]) {
+    const def = RuleDefinitions[code]
+    const specific = processedByType.get(code + '|' + (reportType || ''))
+    const global = processedByType.get(code + '|GLOBAL')
+    if (reportType && specific) {
+      result.push(specific)
+    } else if (global) {
+      result.push(global)
+    } else {
+      result.push({
+        ruleCode: code,
+        ruleName: def.name,
+        enabled: true,
+        severity: def.defaultSeverity,
+        reportType: null,
+      })
+    }
+  }
+  return result
+}
+
+export function applyRuleConfigs(
+  issues: RuleCheckIssue[],
+  configs: EffectiveRuleConfig[],
+): RuleCheckIssue[] {
+  const configMap = new Map(configs.map(c => [c.ruleCode, c]))
+  return issues
+    .map(issue => {
+      const cfg = configMap.get(issue.ruleCode as RuleCode)
+      if (!cfg || !cfg.enabled) return null
+      const effectiveSeverity = cfg.severity || issue.severity
+      return { ...issue, severity: effectiveSeverity }
+    })
+    .filter((v): v is RuleCheckIssue => v !== null)
+}
+
+export async function runAllRules(
+  report: ReportShape,
+  opts?: { useConfigs?: boolean },
+): Promise<RuleCheckIssue[]> {
+  const issues = [
     checkExamName(report),
     checkExamNameStandard(report),
     checkToothPositionFormat(report),
@@ -260,6 +329,11 @@ export function runAllRules(report: ReportShape): RuleCheckIssue[] {
     checkRecommendations(report),
     checkTerminologyConsistency(report),
   ]
+  if (opts?.useConfigs) {
+    const configs = await loadEffectiveRuleConfigs(report.type)
+    return applyRuleConfigs(issues, configs)
+  }
+  return issues
 }
 
 export function issuesToDbRecords(

@@ -41,6 +41,8 @@ model User {
   samplingRulesAsAuditor    SamplingRule[] @relation("SamplingRuleAuditor")
   samplingRulesAsSubmitter  SamplingRule[] @relation("SamplingRuleSubmitter")
   samplingRulesAsCreator    SamplingRule[] @relation("SamplingRuleCreator")
+  ruleConfigsAsCreator      RuleConfig[] @relation("RuleConfigCreator")
+  samplingRunsAsTrigger     SamplingRun[] @relation("SamplingRunTrigger")
 }
 
 model Report {
@@ -138,9 +140,13 @@ model AuditFeedback {
   issueLabel     String
   fieldName      String?
   oldValue       String?
+  newValue       String?
   modification   String   @default("")
   note           String   @default("")
   isResolved     Boolean  @default(false)
+  resolvedBy     String?
+  resolvedAction String?
+  resolvedNote   String?
   resolvedAt     DateTime?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
@@ -148,4 +154,58 @@ model AuditFeedback {
   task           AuditTask @relation(fields: [taskId], references: [id])
   report         Report    @relation(fields: [reportId], references: [id])
   auditor        User      @relation("AuditFeedbackAuditor", fields: [auditorId], references: [id])
+}
+
+model RuleConfig {
+  id          String   @id @default(uuid())
+  ruleCode    String
+  ruleName    String
+  reportType  String?
+  enabled     Boolean  @default(true)
+  severity    String   @default("WARNING")
+  createdById String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  createdBy   User     @relation("RuleConfigCreator", fields: [createdById], references: [id])
+
+  @@unique([ruleCode, reportType], name: "RuleConfigRuleCodeReportTypeKey")
+}
+
+model SamplingRun {
+  id            String   @id @default(uuid())
+  taskDate      DateTime
+  status        String   @default("COMPLETED")
+  totalReports  Int      @default(0)
+  createdTasks  Int      @default(0)
+  skippedTasks  Int      @default(0)
+  triggeredById String
+  triggerType   String   @default("SCHEDULED")
+  note          String?
+  createdAt     DateTime @default(now())
+
+  triggeredBy   User     @relation("SamplingRunTrigger", fields: [triggeredById], references: [id])
+  items         SamplingRunItem[]
+}
+
+model SamplingRunItem {
+  id              String    @id @default(uuid())
+  runId           String
+  reportId        String
+  reportNo        String
+  clinicId        String
+  submitterId     String
+  reportType      String
+  matchedRuleId   String?
+  matchedRuleName String?
+  samplingRate    Float     @default(0)
+  selected        Boolean   @default(false)
+  existingTask    Boolean   @default(false)
+  assignedToId    String?
+  priority        Int       @default(0)
+  createdAt       DateTime  @default(now())
+
+  run             SamplingRun @relation(fields: [runId], references: [id])
+
+  @@index([runId, selected], name: "SamplingRunItemRunIdSelectedIdx")
 }

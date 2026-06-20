@@ -1,6 +1,6 @@
 import { PrismaClient } from '@prisma/client'
 import bcrypt from 'bcryptjs'
-import { UserRole, ReportType, ReportStatus } from '../src/lib/enums'
+import { UserRole, ReportType, ReportStatus, RuleDefinitions, RuleCode } from '../src/lib/enums'
 import { runAllRules, issuesToDbRecords } from '../src/services/ruleChecker'
 
 const prisma = new PrismaClient()
@@ -319,7 +319,7 @@ async function main() {
       },
     })
 
-    const issues = runAllRules(report as any)
+    const issues = await runAllRules(report as any)
     const dbRecords = issuesToDbRecords(report.id, issues)
     await prisma.ruleCheckResult.createMany({ data: dbRecords })
 
@@ -335,6 +335,35 @@ async function main() {
   }
 
   console.log('✅ 示例报告已创建并执行规则检查')
+
+  // 默认 RuleConfig：7 条规则 × (null 全局 + PANORAMIC_XRAY + CBCT) = 21 条
+  const reportTypeScope: (string | null)[] = [null, ReportType.PANORAMIC_XRAY, ReportType.CBCT]
+  let defaultRuleCount = 0
+  for (const code of Object.values(RuleCode) as string[]) {
+    for (const rt of reportTypeScope) {
+      const existing = await prisma.ruleConfig.findFirst({
+        where: {
+          ruleCode: code,
+          reportType: rt,
+        },
+      })
+      if (!existing) {
+        await prisma.ruleConfig.create({
+          data: {
+            ruleCode: code,
+            ruleName: (RuleDefinitions as any)[code].name,
+            reportType: rt,
+            enabled: true,
+            severity: (RuleDefinitions as any)[code].defaultSeverity,
+            createdById: admin.id,
+          },
+        })
+      }
+      defaultRuleCount++
+    }
+  }
+  console.log(`✅ 规则配置默认值已准备 (${defaultRuleCount} 条)`)
+
   console.log('\n🎉 种子数据填充完成！')
   console.log('')
   console.log('📌 下一步建议：')

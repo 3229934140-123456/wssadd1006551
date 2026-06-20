@@ -1,9 +1,10 @@
 import dayjs from 'dayjs'
 import prisma from '../lib/prisma'
-import { ReportStatus } from '../lib/enums'
+import { ReportStatus, SamplingTriggerType } from '../lib/enums'
 
 export interface SamplingRuleShape {
   id: string
+  name: string
   clinicId: string | null
   auditorId: string | null
   reportType: string | null
@@ -20,6 +21,18 @@ export interface ReportShape {
   type: string
   status: string
   createdAt: Date
+}
+export interface SamplingDetail {
+  reportId: string
+  reportNo: string
+  rate: number
+  selected: boolean
+  existingTask: boolean
+  matchedRuleId?: string | null
+  matchedRuleName?: string | null
+  assignedToId?: string | null
+  priority?: number
+  taskId?: string
 }
 
 function matchRule(report: ReportShape, rule: SamplingRuleShape): boolean {
@@ -43,13 +56,41 @@ function getEffectiveSamplingRate(report: ReportShape, rules: SamplingRuleShape[
   return { rate: 0.1, auditorId: null, matchedRule: null }
 }
 
-export async function generateDailyTasks(targetDate?: Date): Promise<{
+export async function generateDailyTasks(
+  targetDate?: Date,
+  opts?: {
+    triggeredById?: string
+    triggerType?: SamplingTriggerType
+    note?: string
+    regenerateExisting?: boolean
+  },
+): Promise<{
+  runId: string | null
   totalReports: number
   createdTasks: number
-  details: { reportId: string; reportNo: string; rate: number; selected: boolean }[]
+  skippedTasks: number
+  details: SamplingDetail[]
 }> {
+  const triggeredById = opts?.triggeredById
+  const triggerType = opts?.triggerType || SamplingTriggerType.API
+  if (!triggeredById && triggerType === SamplingTriggerType.MANUAL) {
+    throw new Error('手动触发需指定操作人')
+  }
   const date = targetDate || dayjs().startOf('day').toDate()
   const nextDay = dayjs(date).add(1, 'day').toDate()
+  const regenerateExisting = opts?.regenerateExisting ?? false
+
+  const run = triggeredById
+    ? await prisma.samplingRun.create({
+        data: {
+          taskDate: date,
+          status: 'RUNNING',
+          triggeredById,
+          triggerType,
+          note: opts?.note || null,
+        },
+      })
+    : null
 
   const reports = await prisma.report.findMany({
     where: {
@@ -68,56 +109,141 @@ export async function generateDailyTasks(targetDate?: Date): Promise<{
     where: { taskDate: { gte: date, lt: nextDay } },
   })
   const existingReportIds = new Set(existingTasks.map(t => t.reportId))
+  const existingTaskByReport = new Map(existingTasks.map(t => [t.reportId, t]))
 
   const rules = await prisma.samplingRule.findMany({ where: { isActive: true } })
 
-  const results: { reportId: string; reportNo: string; rate: number; selected: boolean }[] = []
+  const details: SamplingDetail[] = []
+  const runItems: any[] = []
   let createdCount = 0
+  let skippedCount = 0
 
-  for (const report of reports) {
-    if (existingReportIds.has(report.id)) {
-      results.push({ reportId: report.id, reportNo: report.reportNo, rate: 0, selected: false })
-      continue
-    }
+  try {
+    for (const report of reports) {
+      const hasExisting = existingReportIds.has(report.id)
+      if (hasExisting && !regenerateExisting) {
+        skippedCount++
+        const existingTask = existingTaskByReport.get(report.id)!
+        details.push({
+          reportId: report.id,
+          reportNo: report.reportNo,
+          rate: 0,
+          selected: true,
+          existingTask: true,
+          taskId: existingTask.id,
+          assignedToId: existingTask.assignedToId,
+          priority: existingTask.priority,
+        })
+        if (run) {
+          runItems.push({
+            runId: run.id,
+            reportId: report.id,
+            reportNo: report.reportNo,
+            clinicId: report.clinicId,
+            submitterId: report.submitterId,
+            reportType: report.type,
+            samplingRate: 0,
+            selected: true,
+            existingTask: true,
+            assignedToId: existingTask.assignedToId,
+            priority: existingTask.priority,
+          })
+        }
+        continue
+      }
 
-    const { rate, auditorId } = getEffectiveSamplingRate(report, rules)
-    const selected = Math.random() < rate
-
-    if (selected) {
-      const priority = report.status === ReportStatus.RULE_CHECK_FAILED ? 10 : 5
+      const { rate, auditorId, matchedRule } = getEffectiveSamplingRate(report, rules)
+      const selected = Math.random() < rate
+      const basePriority = report.status === ReportStatus.RULE_CHECK_FAILED ? 10 : 5
       const hasErrors = await prisma.ruleCheckResult.findFirst({
         where: { reportId: report.id, severity: 'ERROR', passed: false },
       })
-      const task = await prisma.auditTask.create({
-        data: {
-          reportId: report.id,
-          taskDate: date,
-          assignedToId: auditorId,
-          assignedById: auditorId || undefined,
-          assignedAt: auditorId ? new Date() : undefined,
-          status: auditorId ? 'ASSIGNED' : 'PENDING',
-          priority: hasErrors ? priority + 5 : priority,
-        },
-      })
+      const taskPriority = hasErrors ? basePriority + 5 : basePriority
 
-      if (auditorId) {
-        await prisma.report.update({
-          where: { id: report.id },
-          data: { status: ReportStatus.PENDING_AUDIT },
+      let taskId: string | undefined
+      if (selected) {
+        const task = await prisma.auditTask.create({
+          data: {
+            reportId: report.id,
+            taskDate: date,
+            assignedToId: auditorId,
+            assignedById: auditorId || undefined,
+            assignedAt: auditorId ? new Date() : undefined,
+            status: auditorId ? 'ASSIGNED' : 'PENDING',
+            priority: taskPriority,
+          },
         })
+        taskId = task.id
+
+        if (auditorId) {
+          await prisma.report.update({
+            where: { id: report.id },
+            data: { status: ReportStatus.PENDING_AUDIT },
+          })
+        }
+        createdCount++
       }
 
-      createdCount++
-      results.push({ reportId: report.id, reportNo: report.reportNo, rate, selected: true })
-    } else {
-      results.push({ reportId: report.id, reportNo: report.reportNo, rate, selected: false })
-    }
-  }
+      details.push({
+        reportId: report.id,
+        reportNo: report.reportNo,
+        rate,
+        selected,
+        existingTask: false,
+        matchedRuleId: matchedRule?.id ?? null,
+        matchedRuleName: matchedRule?.name ?? null,
+        assignedToId: auditorId,
+        priority: taskPriority,
+        taskId,
+      })
 
-  return {
-    totalReports: reports.length,
-    createdTasks: createdCount,
-    details: results,
+      if (run) {
+        runItems.push({
+          runId: run.id,
+          reportId: report.id,
+          reportNo: report.reportNo,
+          clinicId: report.clinicId,
+          submitterId: report.submitterId,
+          reportType: report.type,
+          matchedRuleId: matchedRule?.id ?? null,
+          matchedRuleName: matchedRule?.name ?? null,
+          samplingRate: rate,
+          selected,
+          existingTask: false,
+          assignedToId: auditorId,
+          priority: taskPriority,
+        })
+      }
+    }
+
+    if (run) {
+      await prisma.samplingRunItem.createMany({ data: runItems })
+      await prisma.samplingRun.update({
+        where: { id: run.id },
+        data: {
+          status: 'COMPLETED',
+          totalReports: reports.length,
+          createdTasks: createdCount,
+          skippedTasks: skippedCount,
+        },
+      })
+    }
+
+    return {
+      runId: run?.id ?? null,
+      totalReports: reports.length,
+      createdTasks: createdCount,
+      skippedTasks: skippedCount,
+      details,
+    }
+  } catch (err) {
+    if (run) {
+      await prisma.samplingRun.update({
+        where: { id: run.id },
+        data: { status: 'FAILED', note: (err as Error).message.slice(0, 500) },
+      })
+    }
+    throw err
   }
 }
 
